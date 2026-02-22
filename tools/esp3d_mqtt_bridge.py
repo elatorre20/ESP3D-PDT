@@ -13,7 +13,10 @@ Why Telnet mode:
 Dependencies:
   pip install paho-mqtt
 
-Example:
+Example (uses default ESP3D/MQTT hosts):
+  python3 tools/esp3d_mqtt_bridge.py
+
+Example (override hosts):
   python3 tools/esp3d_mqtt_bridge.py \
     --esp3d-host 192.168.1.50 \
     --mqtt-host 192.168.1.10 \
@@ -41,6 +44,9 @@ M105_TEMP_REGEX = re.compile(
     r"\b([TB])\s*:\s*(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
+
+DEFAULT_ESP3D_HOST = "192.168.0.50"
+DEFAULT_MQTT_HOST = "192.168.0.10"
 
 
 @dataclass
@@ -211,11 +217,19 @@ class Esp3dMqttBridge:
 def parse_args() -> BridgeConfig:
     parser = argparse.ArgumentParser(description="Poll ESP3D printer status and publish to MQTT")
 
-    parser.add_argument("--esp3d-host", required=True, help="ESP3D hostname/IP, e.g. 192.168.1.50")
+    parser.add_argument(
+        "--esp3d-host",
+        default=DEFAULT_ESP3D_HOST,
+        help=f"ESP3D hostname/IP (default: {DEFAULT_ESP3D_HOST})",
+    )
     parser.add_argument("--telnet-port", type=int, default=23, help="ESP3D Telnet port (default: 23)")
     parser.add_argument("--telnet-timeout-s", type=float, default=5.0, help="Telnet connect timeout")
 
-    parser.add_argument("--mqtt-host", required=True, help="MQTT broker hostname/IP")
+    parser.add_argument(
+        "--mqtt-host",
+        default=DEFAULT_MQTT_HOST,
+        help=f"MQTT broker hostname/IP (default: {DEFAULT_MQTT_HOST})",
+    )
     parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port (default: 1883)")
     parser.add_argument("--mqtt-username", default=None, help="MQTT username")
     parser.add_argument("--mqtt-password", default=None, help="MQTT password")
