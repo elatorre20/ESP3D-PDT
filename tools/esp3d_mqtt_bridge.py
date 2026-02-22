@@ -45,9 +45,6 @@ M105_TEMP_REGEX = re.compile(
     r"\b([TB])\s*:\s*(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
-FAN_SPEED_FROM_M106_REGEX = re.compile(r"\bM106\b[^\n\r]*\bS\s*:?\s*(\d{1,3})", re.IGNORECASE)
-FAN_SPEED_PERCENT_REGEX = re.compile(r"\bfan\s*speed\s*[:=]\s*(\d{1,3})\s*%", re.IGNORECASE)
-FAN_SPEED_VALUE_REGEX = re.compile(r"\bfan\s*speed\s*[:=]\s*(\d{1,3})\b", re.IGNORECASE)
 
 DEFAULT_ESP3D_HOST = "192.168.0.50"
 DEFAULT_MQTT_HOST = "192.168.0.10"
@@ -71,7 +68,6 @@ class BridgeConfig:
     mqtt_retain: bool
     command_response_timeout_s: float
     response_idle_gap_s: float
-    fan_query_cmd: str
 
 
 class Esp3dMqttBridge:
@@ -192,24 +188,6 @@ class Esp3dMqttBridge:
                 values["bed_target"] = float(target)
         return values
 
-    @staticmethod
-    def _parse_fan_status(text: str) -> Dict[str, float]:
-        values: Dict[str, float] = {}
-
-        match = FAN_SPEED_PERCENT_REGEX.search(text)
-        if match:
-            values["fan_speed"] = float(match.group(1))
-            values["fan_speed_raw"] = round((values["fan_speed"] / 100.0) * 255.0, 3)
-            return values
-
-        match = FAN_SPEED_FROM_M106_REGEX.search(text) or FAN_SPEED_VALUE_REGEX.search(text)
-        if match:
-            raw = float(match.group(1))
-            values["fan_speed_raw"] = raw
-            values["fan_speed"] = round((raw / 255.0) * 100.0, 3)
-
-        return values
-
     def _topic_for(self, metric: str) -> str:
         return self.cfg.topic_format.format(root=self.cfg.topic_root.rstrip("/"), metric=metric)
 
@@ -240,13 +218,10 @@ class Esp3dMqttBridge:
             try:
                 m114_text = self._telnet_cmd_and_collect("M114")
                 m105_text = self._telnet_cmd_and_collect("M105")
-                fan_text = self._telnet_cmd_and_collect(self.cfg.fan_query_cmd)
-
                 pos = self._parse_m114(m114_text)
                 temps = self._parse_m105(m105_text)
-                fan = self._parse_fan_status(fan_text)
 
-                metrics = {**pos, **temps, **fan}
+                metrics = {**pos, **temps}
                 for metric, value in metrics.items():
                     self._publish(metric, value)
                 self._publish_bulk(metrics)
@@ -255,8 +230,6 @@ class Esp3dMqttBridge:
                     logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
                 if not temps:
                     logging.warning("No temperature values parsed from M105 response: %r", m105_text)
-                if not fan:
-                    logging.warning("No fan speed parsed from %s response: %r", self.cfg.fan_query_cmd, fan_text)
 
             except (socket.error, ConnectionError, EOFError) as err:
                 logging.warning("Telnet connection issue: %s; reconnecting", err)
@@ -319,7 +292,6 @@ def parse_args() -> BridgeConfig:
     )
     parser.add_argument("--mqtt-qos", type=int, choices=[0, 1, 2], default=0, help="MQTT QoS")
     parser.add_argument("--mqtt-retain", action="store_true", help="Set MQTT retain flag")
-    parser.add_argument("--fan-query-cmd", default="M106", help="Fan status query G-code command (default: M106)")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -343,7 +315,6 @@ def parse_args() -> BridgeConfig:
         mqtt_retain=args.mqtt_retain,
         command_response_timeout_s=args.command_response_timeout_s,
         response_idle_gap_s=args.response_idle_gap_s,
-        fan_query_cmd=args.fan_query_cmd,
     )
 
 
