@@ -164,9 +164,12 @@ class Esp3dMqttBridge:
     @staticmethod
     def _parse_m114(text: str) -> Dict[str, float]:
         values: Dict[str, float] = {}
+        # Marlin M114 can include machine step counters after "Count"
+        # (e.g. "Count X:13200 Y:12240 Z:8340"). Keep the first XYZ values,
+        # which are the Cartesian position values we want to publish.
         for axis, value in M114_REGEX.findall(text):
             axis = axis.lower()
-            if axis in ("x", "y", "z"):
+            if axis in ("x", "y", "z") and axis not in values:
                 values[axis] = float(value)
         return values
 
