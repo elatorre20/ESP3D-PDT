@@ -31,6 +31,7 @@ import re
 import signal
 import socket
 import sys
+import json
 import telnetlib
 import time
 from dataclasses import dataclass
@@ -191,6 +192,20 @@ class Esp3dMqttBridge:
         info = self._mqtt.publish(topic, payload=payload, qos=self.cfg.mqtt_qos, retain=self.cfg.mqtt_retain)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             logging.error("MQTT publish failed topic=%s rc=%s", topic, info.rc)
+        else:
+            logging.info("Published MQTT topic=%s payload=%s", topic, payload)
+
+
+    def _publish_bulk(self, metrics: Dict[str, float]) -> None:
+        if not metrics:
+            return
+        topic = self.cfg.topic_root.rstrip("/")
+        payload = json.dumps(metrics, separators=(",", ":"), sort_keys=True)
+        info = self._mqtt.publish(topic, payload=payload, qos=self.cfg.mqtt_qos, retain=self.cfg.mqtt_retain)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            logging.error("MQTT bulk publish failed topic=%s rc=%s", topic, info.rc)
+        else:
+            logging.info("Published MQTT bulk topic=%s payload=%s", topic, payload)
 
     def run(self) -> None:
         logging.info("Bridge started: polling every %.2fs", self.cfg.poll_interval_s)
@@ -202,8 +217,10 @@ class Esp3dMqttBridge:
                 pos = self._parse_m114(m114_text)
                 temps = self._parse_m105(m105_text)
 
-                for metric, value in {**pos, **temps}.items():
+                metrics = {**pos, **temps}
+                for metric, value in metrics.items():
                     self._publish(metric, value)
+                self._publish_bulk(metrics)
 
                 if not pos:
                     logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
