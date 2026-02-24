@@ -20,7 +20,8 @@ Example (override hosts):
   python3 tools/esp3d_mqtt_bridge.py \
     --esp3d-host 192.168.1.50 \
     --mqtt-host 192.168.1.10 \
-    --topic-root printer/my-printer
+    --name printer \
+    --location-id printer001
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import sys
 import json
 import telnetlib
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -48,8 +50,17 @@ M105_TEMP_REGEX = re.compile(
 
 DEFAULT_ESP3D_HOST = "192.168.1.254"
 DEFAULT_MQTT_HOST = "127.0.0.1"
+DEFAULT_MQTT_TOPIC = "/PDT/EdgeDevice/SensorMsg"
 DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
+
+METRIC_TYPE_MAPPING = {
+    "x": ("x_pos", 1),
+    "y": ("y_pos", 2),
+    "z": ("z_pos", 3),
+    "extruder_actual": ("hotend_temp", 4),
+    "bed_actual": ("bed_temp", 5),
+}
 
 
 @dataclass
@@ -61,8 +72,9 @@ class BridgeConfig:
     mqtt_port: int
     mqtt_username: Optional[str]
     mqtt_password: Optional[str]
-    topic_root: str
-    topic_format: str
+    mqtt_topic: str
+    name: str
+    location_id: str
     poll_interval_s: float
     mqtt_qos: int
     mqtt_retain: bool
@@ -188,29 +200,36 @@ class Esp3dMqttBridge:
                 values["bed_target"] = float(target)
         return values
 
-    def _topic_for(self, metric: str) -> str:
-        return self.cfg.topic_format.format(root=self.cfg.topic_root.rstrip("/"), metric=metric)
-
     def _publish(self, metric: str, value: float) -> None:
-        topic = self._topic_for(metric)
-        payload = f"{value:.3f}".rstrip("0").rstrip(".")
-        info = self._mqtt.publish(topic, payload=payload, qos=self.cfg.mqtt_qos, retain=self.cfg.mqtt_retain)
-        if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            logging.error("MQTT publish failed topic=%s rc=%s", topic, info.rc)
-        else:
-            logging.info("Published MQTT topic=%s payload=%s", topic, payload)
-
-
-    def _publish_bulk(self, metrics: Dict[str, float]) -> None:
-        if not metrics:
+        if metric not in METRIC_TYPE_MAPPING:
+            logging.debug("Skipping unsupported metric for MQTT payload format: %s", metric)
             return
-        topic = self.cfg.topic_root.rstrip("/")
-        payload = json.dumps(metrics, separators=(",", ":"), sort_keys=True)
-        info = self._mqtt.publish(topic, payload=payload, qos=self.cfg.mqtt_qos, retain=self.cfg.mqtt_retain)
+
+        type_name, type_id = METRIC_TYPE_MAPPING[metric]
+        payload = json.dumps(
+            {
+                "timeOffsetSeconds": 0.0,
+                "timeStamp": datetime.now(timezone.utc).isoformat(),
+                "hasError": False,
+                "name": self.cfg.name,
+                "typeID": type_id,
+                "statusCode": 0,
+                "latitude": 0.0,
+                "longitude": 0.0,
+                "elevation": 0.0,
+                "locationID": self.cfg.location_id,
+                "typeName": type_name,
+                "typeCategoryID": 1,
+                "deviceID": self.cfg.location_id,
+                "value": value,
+            },
+            separators=(",", ":"),
+        )
+        info = self._mqtt.publish(self.cfg.mqtt_topic, payload=payload, qos=self.cfg.mqtt_qos, retain=self.cfg.mqtt_retain)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            logging.error("MQTT bulk publish failed topic=%s rc=%s", topic, info.rc)
+            logging.error("MQTT publish failed topic=%s rc=%s", self.cfg.mqtt_topic, info.rc)
         else:
-            logging.info("Published MQTT bulk topic=%s payload=%s", topic, payload)
+            logging.info("Published MQTT topic=%s payload=%s", self.cfg.mqtt_topic, payload)
 
     def run(self) -> None:
         logging.info("Bridge started: polling every %.2fs", self.cfg.poll_interval_s)
@@ -224,7 +243,6 @@ class Esp3dMqttBridge:
                 metrics = {**pos, **temps}
                 for metric, value in metrics.items():
                     self._publish(metric, value)
-                self._publish_bulk(metrics)
 
                 if not pos:
                     logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
@@ -270,11 +288,16 @@ def parse_args() -> BridgeConfig:
     parser.add_argument("--mqtt-username", default=None, help="MQTT username")
     parser.add_argument("--mqtt-password", default=None, help="MQTT password")
 
-    parser.add_argument("--topic-root", default="printer/esp3d", help="Topic root/prefix")
     parser.add_argument(
-        "--topic-format",
-        default="{root}/{metric}",
-        help="Topic template using placeholders {root} and {metric}",
+        "--mqtt-topic",
+        default=DEFAULT_MQTT_TOPIC,
+        help=f"MQTT publish topic (default: {DEFAULT_MQTT_TOPIC})",
+    )
+    parser.add_argument("--name", default="printer", help="Message name field")
+    parser.add_argument(
+        "--location-id",
+        default="printer001",
+        help="Message locationID/deviceID field",
     )
 
     parser.add_argument("--poll-interval-s", type=float, default=2.0, help="Polling interval in seconds")
@@ -308,8 +331,9 @@ def parse_args() -> BridgeConfig:
         mqtt_port=args.mqtt_port,
         mqtt_username=args.mqtt_username,
         mqtt_password=args.mqtt_password,
-        topic_root=args.topic_root,
-        topic_format=args.topic_format,
+        mqtt_topic=args.mqtt_topic,
+        name=args.name,
+        location_id=args.location_id,
         poll_interval_s=args.poll_interval_s,
         mqtt_qos=args.mqtt_qos,
         mqtt_retain=args.mqtt_retain,
