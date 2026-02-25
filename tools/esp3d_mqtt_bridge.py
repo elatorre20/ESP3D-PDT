@@ -49,8 +49,8 @@ M105_TEMP_REGEX = re.compile(
 )
 
 DEFAULT_ESP3D_HOST = "192.168.1.254"
-DEFAULT_MQTT_HOST = "127.0.0.1"
-DEFAULT_MQTT_TOPIC = "/PDT/EdgeDevice/SensorMsg"
+DEFAULT_MQTT_HOST = "192.168.1.105"
+DEFAULT_MQTT_TOPIC = "PDT/Printer/SensorMsg"
 DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
 
@@ -223,7 +223,7 @@ class Esp3dMqttBridge:
                 "deviceID": self.cfg.location_id,
                 "value": value,
             },
-            separators=(",", ":"),
+            separators=(",", ":"), indent=4
         )
         info = self._mqtt.publish(self.cfg.mqtt_topic, payload=payload, qos=self.cfg.mqtt_qos, retain=self.cfg.mqtt_retain)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
