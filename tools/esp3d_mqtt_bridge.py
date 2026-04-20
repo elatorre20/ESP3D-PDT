@@ -55,6 +55,10 @@ DEFAULT_MQTT_TOPIC = "PDT/Printer/SensorMsg"
 DEFAULT_SENSOR_TYPE_CATEGORY_ID = 1000
 DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
+DEFAULT_SIM_SPEED_MM_S = 30.0
+DEFAULT_SIM_DIAMETER_MM = 100.0
+DEFAULT_SIM_LAYER_HEIGHT_MM = 5.0
+DEFAULT_SIM_LAYERS = 10
 
 METRIC_TYPE_MAPPING = {
     "x": ("x_pos", 1),
@@ -84,6 +88,10 @@ class BridgeConfig:
     command_response_timeout_s: float
     response_idle_gap_s: float
     simulate: bool
+    simulation_speed_mm_s: float
+    simulation_diameter_mm: float
+    simulation_layer_height_mm: float
+    simulation_layers: int
 
 
 class Esp3dMqttBridge:
@@ -294,11 +302,11 @@ class Esp3dMqttBridge:
             time.sleep(self.cfg.poll_interval_s)
 
     def _generate_simulated_metrics(self) -> Dict[str, float]:
-        radius_mm = 50.0
-        speed_mm_s = 30.0
+        radius_mm = self.cfg.simulation_diameter_mm / 2.0
+        speed_mm_s = self.cfg.simulation_speed_mm_s
         angular_speed_rad_s = speed_mm_s / radius_mm
-        layer_height_mm = 5.0
-        max_height_mm = 50.0
+        layer_height_mm = self.cfg.simulation_layer_height_mm
+        max_height_mm = layer_height_mm * self.cfg.simulation_layers
 
         dt = self.cfg.poll_interval_s
         self._sim_elapsed_s += dt
@@ -388,6 +396,30 @@ def parse_args() -> BridgeConfig:
         action="store_true",
         help="Publish simulated printer movement/temperatures instead of polling ESP3D",
     )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=DEFAULT_SIM_SPEED_MM_S,
+        help=f"Simulation mode movement speed in mm/s (default: {DEFAULT_SIM_SPEED_MM_S})",
+    )
+    parser.add_argument(
+        "--diameter",
+        type=float,
+        default=DEFAULT_SIM_DIAMETER_MM,
+        help=f"Simulation mode circular movement diameter in mm (default: {DEFAULT_SIM_DIAMETER_MM})",
+    )
+    parser.add_argument(
+        "--layer_height",
+        type=float,
+        default=DEFAULT_SIM_LAYER_HEIGHT_MM,
+        help=f"Simulation mode layer height in mm (default: {DEFAULT_SIM_LAYER_HEIGHT_MM})",
+    )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=DEFAULT_SIM_LAYERS,
+        help=f"Simulation mode layer count before resetting Z to 0 (default: {DEFAULT_SIM_LAYERS})",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -395,6 +427,15 @@ def parse_args() -> BridgeConfig:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    if args.speed <= 0:
+        parser.error("--speed must be greater than 0")
+    if args.diameter <= 0:
+        parser.error("--diameter must be greater than 0")
+    if args.layer_height <= 0:
+        parser.error("--layer_height must be greater than 0")
+    if args.layers <= 0:
+        parser.error("--layers must be greater than 0")
 
     return BridgeConfig(
         esp3d_host=args.esp3d_host,
@@ -414,6 +455,10 @@ def parse_args() -> BridgeConfig:
         command_response_timeout_s=args.command_response_timeout_s,
         response_idle_gap_s=args.response_idle_gap_s,
         simulate=args.simulate,
+        simulation_speed_mm_s=args.speed,
+        simulation_diameter_mm=args.diameter,
+        simulation_layer_height_mm=args.layer_height,
+        simulation_layers=args.layers,
     )
 
 
