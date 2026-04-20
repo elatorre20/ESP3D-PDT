@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import re
 import signal
 import socket
@@ -80,6 +81,7 @@ class BridgeConfig:
     mqtt_retain: bool
     command_response_timeout_s: float
     response_idle_gap_s: float
+    simulate: bool
 
 
 class Esp3dMqttBridge:
@@ -87,6 +89,10 @@ class Esp3dMqttBridge:
         self.cfg = cfg
         self._running = True
         self._tn: Optional[telnetlib.Telnet] = None
+        self._sim_elapsed_s = 0.0
+        self._sim_angle_rad = 0.0
+        self._sim_z_mm = 0.0
+        self._sim_circle_count = 0
 
         self._mqtt = mqtt.Client()
         if cfg.mqtt_username:
@@ -111,7 +117,10 @@ class Esp3dMqttBridge:
     def connect(self) -> None:
         self._mqtt.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=60)
         self._mqtt.loop_start()
-        self._connect_telnet()
+        if self.cfg.simulate:
+            logging.info("Simulation mode enabled: publishing generated printer telemetry.")
+        else:
+            self._connect_telnet()
 
     def close(self) -> None:
         self._mqtt.loop_stop()
@@ -235,21 +244,30 @@ class Esp3dMqttBridge:
         logging.info("Bridge started: polling every %.2fs", self.cfg.poll_interval_s)
         while self._running:
             try:
-                m114_text = self._telnet_cmd_and_collect("M114")
-                m105_text = self._telnet_cmd_and_collect("M105")
-                pos = self._parse_m114(m114_text)
-                temps = self._parse_m105(m105_text)
+                if self.cfg.simulate:
+                    metrics = self._generate_simulated_metrics()
+                    for metric, value in metrics.items():
+                        self._publish(metric, value)
+                else:
+                    m114_text = self._telnet_cmd_and_collect("M114")
+                    m105_text = self._telnet_cmd_and_collect("M105")
+                    pos = self._parse_m114(m114_text)
+                    temps = self._parse_m105(m105_text)
 
-                metrics = {**pos, **temps}
-                for metric, value in metrics.items():
-                    self._publish(metric, value)
+                    metrics = {**pos, **temps}
+                    for metric, value in metrics.items():
+                        self._publish(metric, value)
 
-                if not pos:
-                    logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
-                if not temps:
-                    logging.warning("No temperature values parsed from M105 response: %r", m105_text)
+                    if not pos:
+                        logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
+                    if not temps:
+                        logging.warning("No temperature values parsed from M105 response: %r", m105_text)
 
             except (socket.error, ConnectionError, EOFError) as err:
+                if self.cfg.simulate:
+                    logging.exception("Simulation loop error: %s", err)
+                    time.sleep(self.cfg.poll_interval_s)
+                    continue
                 logging.warning("Telnet connection issue: %s; reconnecting", err)
                 if self._tn:
                     try:
@@ -266,6 +284,42 @@ class Esp3dMqttBridge:
                 logging.exception("Bridge loop error: %s", err)
 
             time.sleep(self.cfg.poll_interval_s)
+
+    def _generate_simulated_metrics(self) -> Dict[str, float]:
+        radius_mm = 50.0
+        speed_mm_s = 30.0
+        angular_speed_rad_s = speed_mm_s / radius_mm
+        layer_height_mm = 5.0
+        max_height_mm = 50.0
+
+        dt = self.cfg.poll_interval_s
+        self._sim_elapsed_s += dt
+        self._sim_angle_rad += angular_speed_rad_s * dt
+
+        current_circles = int(self._sim_angle_rad / (2.0 * math.pi))
+        if current_circles > self._sim_circle_count:
+            self._sim_circle_count = current_circles
+            if self._sim_z_mm >= max_height_mm:
+                self._sim_z_mm = 0.0
+                self._sim_circle_count = 0
+                self._sim_angle_rad = math.fmod(self._sim_angle_rad, 2.0 * math.pi)
+            else:
+                self._sim_z_mm = min(max_height_mm, self._sim_z_mm + layer_height_mm)
+
+        phase = math.fmod(self._sim_angle_rad, 2.0 * math.pi)
+        x = radius_mm * math.cos(phase)
+        y = radius_mm * math.sin(phase)
+
+        extruder_actual = 220.0 + 2.5 * math.sin(self._sim_elapsed_s * 0.9) + 0.6 * math.sin(self._sim_elapsed_s * 2.3)
+        bed_actual = 90.0 + 1.5 * math.sin(self._sim_elapsed_s * 0.5 + 0.8) + 0.4 * math.sin(self._sim_elapsed_s * 1.7)
+
+        return {
+            "x": x,
+            "y": y,
+            "z": self._sim_z_mm,
+            "extruder_actual": extruder_actual,
+            "bed_actual": bed_actual,
+        }
 
 
 def parse_args() -> BridgeConfig:
@@ -315,6 +369,11 @@ def parse_args() -> BridgeConfig:
     )
     parser.add_argument("--mqtt-qos", type=int, choices=[0, 1, 2], default=0, help="MQTT QoS")
     parser.add_argument("--mqtt-retain", action="store_true", help="Set MQTT retain flag")
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Publish simulated printer movement/temperatures instead of polling ESP3D",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -339,6 +398,7 @@ def parse_args() -> BridgeConfig:
         mqtt_retain=args.mqtt_retain,
         command_response_timeout_s=args.command_response_timeout_s,
         response_idle_gap_s=args.response_idle_gap_s,
+        simulate=args.simulate,
     )
 
 
