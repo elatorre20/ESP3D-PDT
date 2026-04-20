@@ -52,6 +52,7 @@ M105_TEMP_REGEX = re.compile(
 DEFAULT_ESP3D_HOST = "192.168.1.254"
 DEFAULT_MQTT_HOST = "192.168.1.105"
 DEFAULT_MQTT_TOPIC = "PDT/Printer/SensorMsg"
+DEFAULT_SENSOR_TYPE_CATEGORY_ID = 1000
 DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
 
@@ -74,6 +75,7 @@ class BridgeConfig:
     mqtt_username: Optional[str]
     mqtt_password: Optional[str]
     mqtt_topic: str
+    sensor_type_category_id: int
     name: str
     location_id: str
     poll_interval_s: float
@@ -117,6 +119,7 @@ class Esp3dMqttBridge:
     def connect(self) -> None:
         self._mqtt.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=60)
         self._mqtt.loop_start()
+        logging.info("Using sensor typeCategoryID=%d", self.cfg.sensor_type_category_id)
         if self.cfg.simulate:
             logging.info("Simulation mode enabled: publishing generated printer telemetry.")
         else:
@@ -220,7 +223,9 @@ class Esp3dMqttBridge:
                 "timeOffsetSeconds": 0.0,
                 "timeStamp": datetime.now(timezone.utc).isoformat(),
                 "hasError": False,
-                "name": self.cfg.name,
+                # Unity SensorData handlers match telemetry channels by `name`
+                # (e.g., x_pos, y_pos, z_pos, hotend_temp, bed_temp).
+                "name": type_name,
                 "typeID": type_id,
                 "statusCode": 0,
                 "latitude": 0.0,
@@ -228,11 +233,14 @@ class Esp3dMqttBridge:
                 "elevation": 0.0,
                 "locationID": self.cfg.location_id,
                 "typeName": type_name,
-                "typeCategoryID": 1,
+                "typeCategoryID": self.cfg.sensor_type_category_id,
                 "deviceID": self.cfg.location_id,
+                "dataContainerType": "LabBenchStudios.Pdt.Data.SensorData",
+                "isEnabled": True,
+                "isSystemOnline": True,
                 "value": value,
             },
-            separators=(",", ":"), indent=4
+            separators=(",", ":")
         )
         info = self._mqtt.publish(self.cfg.mqtt_topic, payload=payload, qos=self.cfg.mqtt_qos, retain=self.cfg.mqtt_retain)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
@@ -347,6 +355,12 @@ def parse_args() -> BridgeConfig:
         default=DEFAULT_MQTT_TOPIC,
         help=f"MQTT publish topic (default: {DEFAULT_MQTT_TOPIC})",
     )
+    parser.add_argument(
+        "--sensor-type-category-id",
+        type=int,
+        default=DEFAULT_SENSOR_TYPE_CATEGORY_ID,
+        help=f"Sensor typeCategoryID payload value (default: {DEFAULT_SENSOR_TYPE_CATEGORY_ID})",
+    )
     parser.add_argument("--name", default="printer", help="Message name field")
     parser.add_argument(
         "--location-id",
@@ -391,6 +405,7 @@ def parse_args() -> BridgeConfig:
         mqtt_username=args.mqtt_username,
         mqtt_password=args.mqtt_password,
         mqtt_topic=args.mqtt_topic,
+        sensor_type_category_id=args.sensor_type_category_id,
         name=args.name,
         location_id=args.location_id,
         poll_interval_s=args.poll_interval_s,
