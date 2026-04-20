@@ -323,8 +323,10 @@ class Esp3dMqttBridge:
                 self._sim_z_mm = min(max_height_mm, self._sim_z_mm + layer_height_mm)
 
         phase = math.fmod(self._sim_angle_rad, 2.0 * math.pi)
-        x = radius_mm * math.cos(phase)
-        y = radius_mm * math.sin(phase)
+        build_plate_center_x_mm = 150.0
+        build_plate_center_y_mm = 150.0
+        x = build_plate_center_x_mm + (radius_mm * math.cos(phase))
+        y = build_plate_center_y_mm + (radius_mm * math.sin(phase))
 
         extruder_actual = 220.0 + 2.5 * math.sin(self._sim_elapsed_s * 0.9) + 0.6 * math.sin(self._sim_elapsed_s * 2.3)
         bed_actual = 90.0 + 1.5 * math.sin(self._sim_elapsed_s * 0.5 + 0.8) + 0.4 * math.sin(self._sim_elapsed_s * 1.7)
