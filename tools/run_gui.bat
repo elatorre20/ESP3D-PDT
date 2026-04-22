@@ -1,0 +1,1 @@
+python .\esp3d_mqtt_bridge.py --gui
