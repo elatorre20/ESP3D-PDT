@@ -494,11 +494,10 @@ def parse_args() -> BridgeConfig:
 class BridgeGui:
     def __init__(self, cfg: BridgeConfig) -> None:
         import tkinter as tk
-        from tkinter import messagebox, simpledialog
+        from tkinter import messagebox
 
         self._tk = tk
         self._messagebox = messagebox
-        self._simpledialog = simpledialog
         self._cfg = copy.deepcopy(cfg)
         self._bridge: Optional[Esp3dMqttBridge] = None
         self._worker: Optional[threading.Thread] = None
@@ -511,6 +510,10 @@ class BridgeGui:
         self.mqtt_ip_var = tk.StringVar(value=cfg.mqtt_host)
         self.esp_ip_var = tk.StringVar(value=cfg.esp3d_host)
         self.data_rate_var = tk.StringVar(value=str(cfg.poll_interval_s))
+        self.sim_diameter_var = tk.StringVar(value=str(cfg.simulation_diameter_mm))
+        self.sim_layer_height_var = tk.StringVar(value=str(cfg.simulation_layer_height_mm))
+        self.sim_layers_var = tk.StringVar(value=str(cfg.simulation_layers))
+        self.sim_speed_var = tk.StringVar(value=str(cfg.simulation_speed_mm_s))
         self.status_var = tk.StringVar(value="Disconnected")
 
         self._build_ui()
@@ -543,27 +546,41 @@ class BridgeGui:
         )
 
         tk.Label(self.root, text="Simulation Controls:").grid(row=6, column=0, sticky="w", padx=8, pady=8)
-        self.diameter_btn = tk.Button(self.root, text="Set Circle Diameter", command=self._set_diameter, width=20)
-        self.diameter_btn.grid(row=7, column=0, padx=8, pady=4)
-        self.layer_height_btn = tk.Button(self.root, text="Set Layer Height", command=self._set_layer_height, width=20)
-        self.layer_height_btn.grid(row=7, column=1, padx=8, pady=4)
-        self.layers_btn = tk.Button(self.root, text="Set Layer Number", command=self._set_layers, width=20)
-        self.layers_btn.grid(row=8, column=0, padx=8, pady=4)
-        self.speed_btn = tk.Button(self.root, text="Set Speed", command=self._set_speed, width=20)
-        self.speed_btn.grid(row=8, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Circle Diameter (mm):").grid(row=7, column=0, sticky="w", padx=8, pady=4)
+        self.sim_diameter_entry = tk.Entry(self.root, textvariable=self.sim_diameter_var, width=24)
+        self.sim_diameter_entry.grid(row=7, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Layer Height (mm):").grid(row=8, column=0, sticky="w", padx=8, pady=4)
+        self.sim_layer_height_entry = tk.Entry(self.root, textvariable=self.sim_layer_height_var, width=24)
+        self.sim_layer_height_entry.grid(row=8, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Layer Number:").grid(row=9, column=0, sticky="w", padx=8, pady=4)
+        self.sim_layers_entry = tk.Entry(self.root, textvariable=self.sim_layers_var, width=24)
+        self.sim_layers_entry.grid(row=9, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Speed (mm/s):").grid(row=10, column=0, sticky="w", padx=8, pady=4)
+        self.sim_speed_entry = tk.Entry(self.root, textvariable=self.sim_speed_var, width=24)
+        self.sim_speed_entry.grid(row=10, column=1, padx=8, pady=4)
+
+        self.update_sim_btn = tk.Button(self.root, text="Update All Sim Settings", command=self._update_all_sim_settings, width=42)
+        self.update_sim_btn.grid(row=11, column=0, columnspan=2, padx=8, pady=8)
         self.reset_btn = tk.Button(self.root, text="Reset to Bottom Layer Start", command=self._reset_pattern, width=42)
-        self.reset_btn.grid(row=9, column=0, columnspan=2, padx=8, pady=8)
+        self.reset_btn.grid(row=12, column=0, columnspan=2, padx=8, pady=6)
 
         tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="blue").grid(
-            row=10, column=0, columnspan=2, sticky="w", padx=8, pady=8
+            row=13, column=0, columnspan=2, sticky="w", padx=8, pady=8
         )
 
         self._update_sim_buttons_state()
 
     def _update_sim_buttons_state(self) -> None:
         state = self._tk.NORMAL if self._cfg.simulate else self._tk.DISABLED
-        for btn in (self.diameter_btn, self.layer_height_btn, self.layers_btn, self.speed_btn, self.reset_btn):
-            btn.configure(state=state)
+        for widget in (
+            self.sim_diameter_entry,
+            self.sim_layer_height_entry,
+            self.sim_layers_entry,
+            self.sim_speed_entry,
+            self.update_sim_btn,
+            self.reset_btn,
+        ):
+            widget.configure(state=state)
 
     def _start_bridge(self) -> None:
         self._bridge = Esp3dMqttBridge(copy.deepcopy(self._cfg))
@@ -638,33 +655,38 @@ class BridgeGui:
         self._cfg.esp3d_host = esp_ip
         self._restart_bridge()
 
-    def _set_diameter(self) -> None:
-        value = self._simpledialog.askfloat("Circle Diameter", "Diameter (mm):", minvalue=0.001)
-        if value:
-            self._cfg.simulation_diameter_mm = value
-            if self._bridge:
-                self._bridge.update_simulation_settings(diameter_mm=value)
+    def _update_all_sim_settings(self) -> None:
+        try:
+            diameter = float(self.sim_diameter_var.get().strip())
+            layer_height = float(self.sim_layer_height_var.get().strip())
+            layers = int(self.sim_layers_var.get().strip())
+            speed = float(self.sim_speed_var.get().strip())
+        except ValueError:
+            self._messagebox.showerror(
+                "Invalid Input",
+                "Simulation settings must be valid numeric values.",
+            )
+            return
 
-    def _set_layer_height(self) -> None:
-        value = self._simpledialog.askfloat("Layer Height", "Layer height (mm):", minvalue=0.001)
-        if value:
-            self._cfg.simulation_layer_height_mm = value
-            if self._bridge:
-                self._bridge.update_simulation_settings(layer_height_mm=value)
+        if diameter <= 0 or layer_height <= 0 or layers <= 0 or speed <= 0:
+            self._messagebox.showerror(
+                "Invalid Input",
+                "Diameter, layer height, layer number, and speed must all be greater than 0.",
+            )
+            return
 
-    def _set_layers(self) -> None:
-        value = self._simpledialog.askinteger("Layer Number", "Layer count:", minvalue=1)
-        if value:
-            self._cfg.simulation_layers = value
-            if self._bridge:
-                self._bridge.update_simulation_settings(layers=value)
+        self._cfg.simulation_diameter_mm = diameter
+        self._cfg.simulation_layer_height_mm = layer_height
+        self._cfg.simulation_layers = layers
+        self._cfg.simulation_speed_mm_s = speed
 
-    def _set_speed(self) -> None:
-        value = self._simpledialog.askfloat("Speed", "Speed (mm/s):", minvalue=0.001)
-        if value:
-            self._cfg.simulation_speed_mm_s = value
-            if self._bridge:
-                self._bridge.update_simulation_settings(speed_mm_s=value)
+        if self._bridge:
+            self._bridge.update_simulation_settings(
+                diameter_mm=diameter,
+                layer_height_mm=layer_height,
+                layers=layers,
+                speed_mm_s=speed,
+            )
 
     def _reset_pattern(self) -> None:
         if self._bridge:
