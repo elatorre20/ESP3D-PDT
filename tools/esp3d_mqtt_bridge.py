@@ -27,6 +27,7 @@ Example (override hosts):
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import math
 import re
@@ -35,6 +36,7 @@ import socket
 import sys
 import json
 import telnetlib
+import threading
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -123,6 +125,30 @@ class Esp3dMqttBridge:
     def stop(self) -> None:
         logging.info("Stopping bridge...")
         self._running = False
+
+    def update_simulation_settings(
+        self,
+        *,
+        speed_mm_s: Optional[float] = None,
+        diameter_mm: Optional[float] = None,
+        layer_height_mm: Optional[float] = None,
+        layers: Optional[int] = None,
+    ) -> None:
+        if speed_mm_s is not None:
+            self.cfg.simulation_speed_mm_s = speed_mm_s
+        if diameter_mm is not None:
+            self.cfg.simulation_diameter_mm = diameter_mm
+        if layer_height_mm is not None:
+            self.cfg.simulation_layer_height_mm = layer_height_mm
+        if layers is not None:
+            self.cfg.simulation_layers = layers
+
+    def reset_simulation_pattern(self) -> None:
+        self._sim_elapsed_s = 0.0
+        self._sim_angle_rad = 0.0
+        self._sim_z_mm = 0.0
+        self._sim_circle_count = 0
+        logging.info("Simulation pattern reset to bottom layer start")
 
     def connect(self) -> None:
         self._mqtt.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=60)
@@ -423,6 +449,7 @@ def parse_args() -> BridgeConfig:
         help=f"Simulation mode layer count before resetting Z to 0 (default: {DEFAULT_SIM_LAYERS})",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--gui", action="store_true", help="Launch interactive GUI controls")
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -461,11 +488,163 @@ def parse_args() -> BridgeConfig:
         simulation_diameter_mm=args.diameter,
         simulation_layer_height_mm=args.layer_height,
         simulation_layers=args.layers,
-    )
+    ), args.gui
+
+
+class BridgeGui:
+    def __init__(self, cfg: BridgeConfig) -> None:
+        import tkinter as tk
+        from tkinter import messagebox, simpledialog
+
+        self._tk = tk
+        self._messagebox = messagebox
+        self._simpledialog = simpledialog
+        self._cfg = copy.deepcopy(cfg)
+        self._bridge: Optional[Esp3dMqttBridge] = None
+        self._worker: Optional[threading.Thread] = None
+
+        self.root = tk.Tk()
+        self.root.title("ESP3D MQTT Bridge Control")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.mode_var = tk.StringVar(value="Sim" if cfg.simulate else "Real")
+        self.mqtt_ip_var = tk.StringVar(value=cfg.mqtt_host)
+        self.esp_ip_var = tk.StringVar(value=cfg.esp3d_host)
+        self.status_var = tk.StringVar(value="Disconnected")
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        tk = self._tk
+        tk.Label(self.root, text="Telemetry Mode:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        self.mode_button = tk.Button(self.root, textvariable=self.mode_var, command=self._toggle_mode, width=20)
+        self.mode_button.grid(row=0, column=1, padx=8, pady=6)
+
+        tk.Label(self.root, text="MQTT Broker IP:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        tk.Entry(self.root, textvariable=self.mqtt_ip_var, width=24).grid(row=1, column=1, padx=8, pady=6)
+
+        tk.Label(self.root, text="ESP IP:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        tk.Entry(self.root, textvariable=self.esp_ip_var, width=24).grid(row=2, column=1, padx=8, pady=6)
+
+        tk.Button(self.root, text="Reconnect (New IPs)", command=self._reconnect_with_ips, width=20).grid(
+            row=3, column=0, columnspan=2, padx=8, pady=8
+        )
+
+        tk.Label(self.root, text="Simulation Controls:").grid(row=4, column=0, sticky="w", padx=8, pady=8)
+        self.diameter_btn = tk.Button(self.root, text="Set Circle Diameter", command=self._set_diameter, width=20)
+        self.diameter_btn.grid(row=5, column=0, padx=8, pady=4)
+        self.layer_height_btn = tk.Button(self.root, text="Set Layer Height", command=self._set_layer_height, width=20)
+        self.layer_height_btn.grid(row=5, column=1, padx=8, pady=4)
+        self.layers_btn = tk.Button(self.root, text="Set Layer Number", command=self._set_layers, width=20)
+        self.layers_btn.grid(row=6, column=0, padx=8, pady=4)
+        self.speed_btn = tk.Button(self.root, text="Set Speed", command=self._set_speed, width=20)
+        self.speed_btn.grid(row=6, column=1, padx=8, pady=4)
+        self.reset_btn = tk.Button(self.root, text="Reset to Bottom Layer Start", command=self._reset_pattern, width=42)
+        self.reset_btn.grid(row=7, column=0, columnspan=2, padx=8, pady=8)
+
+        tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="blue").grid(
+            row=8, column=0, columnspan=2, sticky="w", padx=8, pady=8
+        )
+
+        self._update_sim_buttons_state()
+
+    def _update_sim_buttons_state(self) -> None:
+        state = self._tk.NORMAL if self._cfg.simulate else self._tk.DISABLED
+        for btn in (self.diameter_btn, self.layer_height_btn, self.layers_btn, self.speed_btn, self.reset_btn):
+            btn.configure(state=state)
+
+    def _start_bridge(self) -> None:
+        self._bridge = Esp3dMqttBridge(copy.deepcopy(self._cfg))
+        self._bridge.connect()
+
+        def _run_bridge() -> None:
+            assert self._bridge is not None
+            try:
+                self._bridge.run()
+            finally:
+                self._bridge.close()
+
+        self._worker = threading.Thread(target=_run_bridge, daemon=True)
+        self._worker.start()
+        self.status_var.set(f"Connected ({'Sim' if self._cfg.simulate else 'Real'} mode)")
+
+    def _stop_bridge(self) -> None:
+        if self._bridge is not None:
+            self._bridge.stop()
+        if self._worker is not None:
+            self._worker.join(timeout=3.0)
+        self._bridge = None
+        self._worker = None
+        self.status_var.set("Disconnected")
+
+    def _restart_bridge(self) -> None:
+        self._stop_bridge()
+        self._start_bridge()
+
+    def _toggle_mode(self) -> None:
+        self._cfg.simulate = not self._cfg.simulate
+        self.mode_var.set("Sim" if self._cfg.simulate else "Real")
+        self._update_sim_buttons_state()
+        self._restart_bridge()
+
+    def _reconnect_with_ips(self) -> None:
+        mqtt_ip = self.mqtt_ip_var.get().strip()
+        esp_ip = self.esp_ip_var.get().strip()
+        if not mqtt_ip or not esp_ip:
+            self._messagebox.showerror("Invalid Input", "MQTT broker IP and ESP IP are both required.")
+            return
+        self._cfg.mqtt_host = mqtt_ip
+        self._cfg.esp3d_host = esp_ip
+        self._restart_bridge()
+
+    def _set_diameter(self) -> None:
+        value = self._simpledialog.askfloat("Circle Diameter", "Diameter (mm):", minvalue=0.001)
+        if value:
+            self._cfg.simulation_diameter_mm = value
+            if self._bridge:
+                self._bridge.update_simulation_settings(diameter_mm=value)
+
+    def _set_layer_height(self) -> None:
+        value = self._simpledialog.askfloat("Layer Height", "Layer height (mm):", minvalue=0.001)
+        if value:
+            self._cfg.simulation_layer_height_mm = value
+            if self._bridge:
+                self._bridge.update_simulation_settings(layer_height_mm=value)
+
+    def _set_layers(self) -> None:
+        value = self._simpledialog.askinteger("Layer Number", "Layer count:", minvalue=1)
+        if value:
+            self._cfg.simulation_layers = value
+            if self._bridge:
+                self._bridge.update_simulation_settings(layers=value)
+
+    def _set_speed(self) -> None:
+        value = self._simpledialog.askfloat("Speed", "Speed (mm/s):", minvalue=0.001)
+        if value:
+            self._cfg.simulation_speed_mm_s = value
+            if self._bridge:
+                self._bridge.update_simulation_settings(speed_mm_s=value)
+
+    def _reset_pattern(self) -> None:
+        if self._bridge:
+            self._bridge.reset_simulation_pattern()
+
+    def _on_close(self) -> None:
+        self._stop_bridge()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self._start_bridge()
+        self.root.mainloop()
 
 
 def main() -> int:
-    cfg = parse_args()
+    cfg, gui_mode = parse_args()
+    if gui_mode:
+        app = BridgeGui(cfg)
+        app.run()
+        return 0
+
     bridge = Esp3dMqttBridge(cfg)
 
     def _handle_signal(signum, frame):
