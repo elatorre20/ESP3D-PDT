@@ -54,6 +54,7 @@ M105_TEMP_REGEX = re.compile(
 DEFAULT_ESP3D_HOST = "192.168.1.254"
 DEFAULT_MQTT_HOST = "192.168.1.105"
 DEFAULT_MQTT_TOPIC = "PDT/Printer/SensorMsg"
+DEFAULT_MQTT_COMMAND_TOPIC = "PDT/EdgeDevice/ActuatorCmd"
 DEFAULT_SENSOR_TYPE_CATEGORY_ID = 1000
 DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
@@ -81,6 +82,7 @@ class BridgeConfig:
     mqtt_username: Optional[str]
     mqtt_password: Optional[str]
     mqtt_topic: str
+    mqtt_command_topic: str
     sensor_type_category_id: int
     name: str
     location_id: str
@@ -101,6 +103,7 @@ class Esp3dMqttBridge:
         self.cfg = cfg
         self._running = True
         self._tn: Optional[telnetlib.Telnet] = None
+        self._telnet_lock = threading.RLock()
         self._sim_elapsed_s = 0.0
         self._sim_angle_rad = 0.0
         self._sim_z_mm = 0.0
@@ -111,16 +114,80 @@ class Esp3dMqttBridge:
             self._mqtt.username_pw_set(cfg.mqtt_username, cfg.mqtt_password)
         self._mqtt.on_connect = self._on_connect
         self._mqtt.on_disconnect = self._on_disconnect
+        self._mqtt.on_message = self._on_message
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             logging.info("Connected to MQTT broker %s:%d", self.cfg.mqtt_host, self.cfg.mqtt_port)
+            for topic in self._build_command_topic_subscriptions(self.cfg.mqtt_command_topic):
+                client.subscribe(topic, qos=self.cfg.mqtt_qos)
+                logging.info("Subscribed to command topic: %s", topic)
         else:
             logging.error("MQTT connect failed with rc=%s", rc)
 
     def _on_disconnect(self, client, userdata, rc):
         if rc != 0:
             logging.warning("Unexpected MQTT disconnect rc=%s", rc)
+
+    def _on_message(self, client, userdata, msg) -> None:
+        _ = client, userdata
+        if self.cfg.simulate:
+            logging.info("Ignoring incoming command in simulation mode topic=%s", msg.topic)
+            return
+
+        payload = msg.payload.decode("utf-8", errors="replace")
+        is_command_topic = self._is_command_topic(msg.topic)
+        looks_like_command = self._payload_looks_like_command(payload)
+        if not is_command_topic and not looks_like_command:
+            logging.debug("Ignoring non-command MQTT message topic=%s", msg.topic)
+            return
+
+        logging.info("Received command candidate topic=%s payload=%s", msg.topic, payload)
+
+        cmd, parse_error = self._extract_printer_command(payload)
+        if not cmd:
+            if is_command_topic:
+                logging.error(
+                    "Invalid command message on topic=%s: %s payload=%s",
+                    msg.topic,
+                    parse_error or "unknown parsing issue",
+                    payload,
+                )
+            else:
+                logging.debug("Ignoring command-like payload that could not be parsed from topic=%s", msg.topic)
+            return
+
+        logging.info("Forwarding command from MQTT topic=%s -> %s", msg.topic, cmd)
+        try:
+            self._telnet_send_only(cmd)
+        except Exception:
+            logging.exception("Failed forwarding command to ESP3D printer: %s", cmd)
+
+    @staticmethod
+    def _build_command_topic_subscriptions(base_topic: str) -> list[str]:
+        base_topic = base_topic.strip()
+        topics = {base_topic}
+
+        if "/ActuatorCmd" in base_topic:
+            topics.add(base_topic.replace("/ActuatorCmd", "/actuator_cmd"))
+        if "/actuator_cmd" in base_topic:
+            topics.add(base_topic.replace("/actuator_cmd", "/ActuatorCmd"))
+        if "/EdgeDevice/" in base_topic:
+            topics.add(base_topic.replace("/EdgeDevice/", "/edge_device/"))
+        if "/edge_device/" in base_topic:
+            topics.add(base_topic.replace("/edge_device/", "/EdgeDevice/"))
+
+        return sorted(t for t in topics if t)
+
+    @staticmethod
+    def _is_command_topic(topic: str) -> bool:
+        topic_l = (topic or "").lower()
+        return "actuator" in topic_l or topic_l.endswith("/cmd") or "command" in topic_l
+
+    @staticmethod
+    def _payload_looks_like_command(payload: str) -> bool:
+        payload_l = (payload or "").lower()
+        return ("\"commandname\"" in payload_l or "\"propertyname\"" in payload_l) and "\"value\"" in payload_l
 
     def stop(self) -> None:
         logging.info("Stopping bridge...")
@@ -168,8 +235,9 @@ class Esp3dMqttBridge:
 
     def _connect_telnet(self) -> None:
         logging.info("Connecting to ESP3D telnet %s:%d", self.cfg.esp3d_host, self.cfg.telnet_port)
-        self._tn = telnetlib.Telnet(self.cfg.esp3d_host, self.cfg.telnet_port, self.cfg.telnet_timeout_s)
-        self._drain_telnet(0.2)
+        with self._telnet_lock:
+            self._tn = telnetlib.Telnet(self.cfg.esp3d_host, self.cfg.telnet_port, self.cfg.telnet_timeout_s)
+            self._drain_telnet(0.2)
 
     def _ensure_telnet(self) -> None:
         if self._tn is None:
@@ -188,36 +256,111 @@ class Esp3dMqttBridge:
                 logging.debug("Drained telnet bytes: %r", chunk.decode("utf-8", errors="replace"))
 
     def _telnet_cmd_and_collect(self, cmd: str) -> str:
-        self._ensure_telnet()
-        assert self._tn is not None
+        with self._telnet_lock:
+            self._ensure_telnet()
+            assert self._tn is not None
 
-        self._drain_telnet(0.1)
-        logging.info("Sending printer command: %s", cmd)
-        self._tn.write((cmd + "\n").encode("utf-8"))
+            self._drain_telnet(0.1)
+            logging.info("Sending printer command: %s", cmd)
+            self._tn.write((cmd + "\n").encode("utf-8"))
 
-        end = time.time() + self.cfg.command_response_timeout_s
-        last_data_time: Optional[float] = None
-        chunks = []
-        while time.time() < end:
-            try:
-                data = self._tn.read_very_eager()
-            except EOFError as err:
-                raise ConnectionError("ESP3D telnet connection closed") from err
-            if data:
-                now = time.time()
-                last_data_time = now
-                chunks.append(data.decode("utf-8", errors="replace"))
-                continue
-            else:
-                # If we already received bytes for this command and line stays idle,
-                # treat the response as complete.
-                if last_data_time is not None and (time.time() - last_data_time) >= self.cfg.response_idle_gap_s:
-                    break
-                time.sleep(0.02)
+            end = time.time() + self.cfg.command_response_timeout_s
+            last_data_time: Optional[float] = None
+            chunks = []
+            while time.time() < end:
+                try:
+                    data = self._tn.read_very_eager()
+                except EOFError as err:
+                    raise ConnectionError("ESP3D telnet connection closed") from err
+                if data:
+                    now = time.time()
+                    last_data_time = now
+                    chunks.append(data.decode("utf-8", errors="replace"))
+                    continue
+                else:
+                    # If we already received bytes for this command and line stays idle,
+                    # treat the response as complete.
+                    if last_data_time is not None and (time.time() - last_data_time) >= self.cfg.response_idle_gap_s:
+                        break
+                    time.sleep(0.02)
 
         text = "".join(chunks)
         logging.info("Raw response for %s: %r", cmd, text)
         return text
+
+    def _telnet_send_only(self, cmd: str) -> None:
+        with self._telnet_lock:
+            self._ensure_telnet()
+            assert self._tn is not None
+            self._drain_telnet(0.05)
+            logging.info("Raw printer command: %s", cmd)
+            self._tn.write((cmd + "\n").encode("utf-8"))
+
+    @staticmethod
+    def _extract_printer_command(payload: str) -> tuple[Optional[str], Optional[str]]:
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return None, "payload is not valid JSON"
+
+        command_name_exact = None
+        command_name_fallback = None
+        command_value = None
+        stack = [data]
+
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for key, value in cur.items():
+                    key_l = str(key).lower()
+                    if command_name_exact is None and key_l in ("commandname", "propertyname"):
+                        if isinstance(value, str):
+                            command_name_exact = value.strip()
+                    if command_name_fallback is None and key_l == "name":
+                        if isinstance(value, str):
+                            command_name_fallback = value.strip()
+                    if command_value is None and key_l in ("value", "targetvalue"):
+                        if isinstance(value, (int, float, str)):
+                            command_value = value
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(cur, list):
+                stack.extend(cur)
+
+        command_name = command_name_exact or command_name_fallback
+        if not command_name:
+            return None, "missing command name (expected commandName/propertyName)"
+
+        def _to_num(value) -> Optional[float]:
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return None
+                try:
+                    return float(value)
+                except ValueError:
+                    return None
+            return None
+
+        value_num = _to_num(command_value)
+        name_key = command_name.strip().lower()
+
+        if name_key in ("printspeedpercent", "printspeedpercentage", "printspeedpct"):
+            if value_num is None:
+                return None, "print speed command missing numeric value"
+            return f"M220 S{int(round(value_num))}", None
+        if name_key in ("targethotendtempc", "hotendtargettemperature", "hotendtargettempc"):
+            if value_num is None:
+                return None, "hotend target temperature command missing numeric value"
+            return f"M104 S{round(value_num, 1):g}", None
+        if name_key in ("targetbedtempc", "bedtargettemperature", "bedtargettempc"):
+            if value_num is None:
+                return None, "bed target temperature command missing numeric value"
+            return f"M140 S{round(value_num, 1):g}", None
+
+        return None, f"unsupported command name '{command_name}'"
 
     @staticmethod
     def _parse_m114(text: str) -> Dict[str, float]:
@@ -392,6 +535,11 @@ def parse_args() -> BridgeConfig:
         help=f"MQTT publish topic (default: {DEFAULT_MQTT_TOPIC})",
     )
     parser.add_argument(
+        "--mqtt-command-topic",
+        default=DEFAULT_MQTT_COMMAND_TOPIC,
+        help=f"MQTT subscribe topic for incoming actuator commands (default: {DEFAULT_MQTT_COMMAND_TOPIC})",
+    )
+    parser.add_argument(
         "--sensor-type-category-id",
         type=int,
         default=DEFAULT_SENSOR_TYPE_CATEGORY_ID,
@@ -475,6 +623,7 @@ def parse_args() -> BridgeConfig:
         mqtt_username=args.mqtt_username,
         mqtt_password=args.mqtt_password,
         mqtt_topic=args.mqtt_topic,
+        mqtt_command_topic=args.mqtt_command_topic,
         sensor_type_category_id=args.sensor_type_category_id,
         name=args.name,
         location_id=args.location_id,
