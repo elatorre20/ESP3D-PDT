@@ -510,6 +510,7 @@ class BridgeGui:
         self.mode_var = tk.StringVar(value="Sim" if cfg.simulate else "Real")
         self.mqtt_ip_var = tk.StringVar(value=cfg.mqtt_host)
         self.esp_ip_var = tk.StringVar(value=cfg.esp3d_host)
+        self.data_rate_var = tk.StringVar(value=str(cfg.poll_interval_s))
         self.status_var = tk.StringVar(value="Disconnected")
 
         self._build_ui()
@@ -517,8 +518,13 @@ class BridgeGui:
     def _build_ui(self) -> None:
         tk = self._tk
         tk.Label(self.root, text="Telemetry Mode:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        self.mode_button = tk.Button(self.root, textvariable=self.mode_var, command=self._toggle_mode, width=20)
-        self.mode_button.grid(row=0, column=1, padx=8, pady=6)
+        mode_frame = tk.Frame(self.root)
+        mode_frame.grid(row=0, column=1, padx=8, pady=6, sticky="w")
+        self.real_mode_btn = tk.Button(mode_frame, text="Real", command=self._set_real_mode, width=9)
+        self.real_mode_btn.grid(row=0, column=0, padx=(0, 4))
+        self.sim_mode_btn = tk.Button(mode_frame, text="Sim", command=self._set_sim_mode, width=9)
+        self.sim_mode_btn.grid(row=0, column=1)
+        self._refresh_mode_button_styles()
 
         tk.Label(self.root, text="MQTT Broker IP:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
         tk.Entry(self.root, textvariable=self.mqtt_ip_var, width=24).grid(row=1, column=1, padx=8, pady=6)
@@ -526,24 +532,30 @@ class BridgeGui:
         tk.Label(self.root, text="ESP IP:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         tk.Entry(self.root, textvariable=self.esp_ip_var, width=24).grid(row=2, column=1, padx=8, pady=6)
 
-        tk.Button(self.root, text="Reconnect (New IPs)", command=self._reconnect_with_ips, width=20).grid(
-            row=3, column=0, columnspan=2, padx=8, pady=8
+        tk.Label(self.root, text="Data Rate (s):").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        tk.Entry(self.root, textvariable=self.data_rate_var, width=24).grid(row=3, column=1, padx=8, pady=6)
+        tk.Button(self.root, text="Apply Data Rate", command=self._apply_data_rate, width=20).grid(
+            row=4, column=0, columnspan=2, padx=8, pady=4
         )
 
-        tk.Label(self.root, text="Simulation Controls:").grid(row=4, column=0, sticky="w", padx=8, pady=8)
+        tk.Button(self.root, text="Reconnect (New IPs)", command=self._reconnect_with_ips, width=20).grid(
+            row=5, column=0, columnspan=2, padx=8, pady=8
+        )
+
+        tk.Label(self.root, text="Simulation Controls:").grid(row=6, column=0, sticky="w", padx=8, pady=8)
         self.diameter_btn = tk.Button(self.root, text="Set Circle Diameter", command=self._set_diameter, width=20)
-        self.diameter_btn.grid(row=5, column=0, padx=8, pady=4)
+        self.diameter_btn.grid(row=7, column=0, padx=8, pady=4)
         self.layer_height_btn = tk.Button(self.root, text="Set Layer Height", command=self._set_layer_height, width=20)
-        self.layer_height_btn.grid(row=5, column=1, padx=8, pady=4)
+        self.layer_height_btn.grid(row=7, column=1, padx=8, pady=4)
         self.layers_btn = tk.Button(self.root, text="Set Layer Number", command=self._set_layers, width=20)
-        self.layers_btn.grid(row=6, column=0, padx=8, pady=4)
+        self.layers_btn.grid(row=8, column=0, padx=8, pady=4)
         self.speed_btn = tk.Button(self.root, text="Set Speed", command=self._set_speed, width=20)
-        self.speed_btn.grid(row=6, column=1, padx=8, pady=4)
+        self.speed_btn.grid(row=8, column=1, padx=8, pady=4)
         self.reset_btn = tk.Button(self.root, text="Reset to Bottom Layer Start", command=self._reset_pattern, width=42)
-        self.reset_btn.grid(row=7, column=0, columnspan=2, padx=8, pady=8)
+        self.reset_btn.grid(row=9, column=0, columnspan=2, padx=8, pady=8)
 
         tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="blue").grid(
-            row=8, column=0, columnspan=2, sticky="w", padx=8, pady=8
+            row=10, column=0, columnspan=2, sticky="w", padx=8, pady=8
         )
 
         self._update_sim_buttons_state()
@@ -581,10 +593,39 @@ class BridgeGui:
         self._stop_bridge()
         self._start_bridge()
 
-    def _toggle_mode(self) -> None:
-        self._cfg.simulate = not self._cfg.simulate
+    def _refresh_mode_button_styles(self) -> None:
+        if self._cfg.simulate:
+            self.sim_mode_btn.configure(relief=self._tk.SUNKEN, bg="lightgreen")
+            self.real_mode_btn.configure(relief=self._tk.RAISED, bg="SystemButtonFace")
+        else:
+            self.real_mode_btn.configure(relief=self._tk.SUNKEN, bg="lightgreen")
+            self.sim_mode_btn.configure(relief=self._tk.RAISED, bg="SystemButtonFace")
+
+    def _set_mode(self, simulate: bool) -> None:
+        if self._cfg.simulate == simulate:
+            return
+        self._cfg.simulate = simulate
         self.mode_var.set("Sim" if self._cfg.simulate else "Real")
+        self._refresh_mode_button_styles()
         self._update_sim_buttons_state()
+        self._restart_bridge()
+
+    def _set_real_mode(self) -> None:
+        self._set_mode(False)
+
+    def _set_sim_mode(self) -> None:
+        self._set_mode(True)
+
+    def _apply_data_rate(self) -> None:
+        try:
+            poll_interval_s = float(self.data_rate_var.get().strip())
+        except ValueError:
+            self._messagebox.showerror("Invalid Input", "Data rate must be a number in seconds.")
+            return
+        if poll_interval_s <= 0:
+            self._messagebox.showerror("Invalid Input", "Data rate must be greater than 0.")
+            return
+        self._cfg.poll_interval_s = poll_interval_s
         self._restart_bridge()
 
     def _reconnect_with_ips(self) -> None:
