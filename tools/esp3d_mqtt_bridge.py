@@ -766,40 +766,44 @@ class BridgeGui:
         tk.Button(self.root, text="Reconnect (New IPs)", command=self._reconnect_with_ips, width=20).grid(
             row=5, column=0, columnspan=2, padx=8, pady=8
         )
+        self.connect_btn = tk.Button(self.root, text="Connect", command=self._start_bridge, width=20)
+        self.connect_btn.grid(row=6, column=0, padx=8, pady=(0, 8))
+        self.disconnect_btn = tk.Button(self.root, text="Disconnect", command=self._stop_bridge, width=20)
+        self.disconnect_btn.grid(row=6, column=1, padx=8, pady=(0, 8))
 
-        tk.Label(self.root, text="Simulation Controls:").grid(row=6, column=0, sticky="w", padx=8, pady=8)
-        tk.Label(self.root, text="Circle Diameter (mm):").grid(row=7, column=0, sticky="w", padx=8, pady=4)
+        tk.Label(self.root, text="Simulation Controls:").grid(row=7, column=0, sticky="w", padx=8, pady=8)
+        tk.Label(self.root, text="Circle Diameter (mm):").grid(row=8, column=0, sticky="w", padx=8, pady=4)
         self.sim_diameter_entry = tk.Entry(self.root, textvariable=self.sim_diameter_var, width=24)
-        self.sim_diameter_entry.grid(row=7, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Layer Height (mm):").grid(row=8, column=0, sticky="w", padx=8, pady=4)
+        self.sim_diameter_entry.grid(row=8, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Layer Height (mm):").grid(row=9, column=0, sticky="w", padx=8, pady=4)
         self.sim_layer_height_entry = tk.Entry(self.root, textvariable=self.sim_layer_height_var, width=24)
-        self.sim_layer_height_entry.grid(row=8, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Layer Number:").grid(row=9, column=0, sticky="w", padx=8, pady=4)
+        self.sim_layer_height_entry.grid(row=9, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Layer Number:").grid(row=10, column=0, sticky="w", padx=8, pady=4)
         self.sim_layers_entry = tk.Entry(self.root, textvariable=self.sim_layers_var, width=24)
-        self.sim_layers_entry.grid(row=9, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Speed (mm/s):").grid(row=10, column=0, sticky="w", padx=8, pady=4)
+        self.sim_layers_entry.grid(row=10, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Speed (mm/s):").grid(row=11, column=0, sticky="w", padx=8, pady=4)
         self.sim_speed_entry = tk.Entry(self.root, textvariable=self.sim_speed_var, width=24)
-        self.sim_speed_entry.grid(row=10, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Extruder Target (C):").grid(row=11, column=0, sticky="w", padx=8, pady=4)
+        self.sim_speed_entry.grid(row=11, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Extruder Target (C):").grid(row=12, column=0, sticky="w", padx=8, pady=4)
         self.sim_extruder_target_entry = tk.Entry(self.root, textvariable=self.sim_extruder_target_var, width=24)
-        self.sim_extruder_target_entry.grid(row=11, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Bed Target (C):").grid(row=12, column=0, sticky="w", padx=8, pady=4)
+        self.sim_extruder_target_entry.grid(row=12, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Bed Target (C):").grid(row=13, column=0, sticky="w", padx=8, pady=4)
         self.sim_bed_target_entry = tk.Entry(self.root, textvariable=self.sim_bed_target_var, width=24)
-        self.sim_bed_target_entry.grid(row=12, column=1, padx=8, pady=4)
+        self.sim_bed_target_entry.grid(row=13, column=1, padx=8, pady=4)
         self.sim_realistic_temp_inertia_check = tk.Checkbutton(
             self.root,
             text="Realistic temperature inertia (1 C/s slew)",
             variable=self.sim_realistic_temp_inertia_var,
         )
-        self.sim_realistic_temp_inertia_check.grid(row=13, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        self.sim_realistic_temp_inertia_check.grid(row=14, column=0, columnspan=2, sticky="w", padx=8, pady=4)
 
         self.update_sim_btn = tk.Button(self.root, text="Update All Sim Settings", command=self._update_all_sim_settings, width=42)
-        self.update_sim_btn.grid(row=14, column=0, columnspan=2, padx=8, pady=8)
+        self.update_sim_btn.grid(row=15, column=0, columnspan=2, padx=8, pady=8)
         self.reset_btn = tk.Button(self.root, text="Reset to Bottom Layer Start", command=self._reset_pattern, width=42)
-        self.reset_btn.grid(row=15, column=0, columnspan=2, padx=8, pady=6)
+        self.reset_btn.grid(row=16, column=0, columnspan=2, padx=8, pady=6)
 
         tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="blue").grid(
-            row=16, column=0, columnspan=2, sticky="w", padx=8, pady=8
+            row=17, column=0, columnspan=2, sticky="w", padx=8, pady=8
         )
 
         self._update_sim_buttons_state()
@@ -820,8 +824,19 @@ class BridgeGui:
             widget.configure(state=state)
 
     def _start_bridge(self) -> None:
+        if self._bridge is not None:
+            self.status_var.set(f"Connected ({'Sim' if self._cfg.simulate else 'Real'} mode)")
+            return
+
         self._bridge = Esp3dMqttBridge(copy.deepcopy(self._cfg))
-        self._bridge.connect()
+        try:
+            self._bridge.connect()
+        except Exception as err:
+            self._bridge = None
+            self._worker = None
+            self.status_var.set(f"Connection failed: {err}")
+            self._messagebox.showerror("Connection Error", f"Unable to connect:\n{err}")
+            return
 
         def _run_bridge() -> None:
             assert self._bridge is not None
@@ -843,9 +858,11 @@ class BridgeGui:
         self._worker = None
         self.status_var.set("Disconnected")
 
-    def _restart_bridge(self) -> None:
+    def _restart_bridge(self, force_connect: bool = False) -> None:
+        was_connected = self._bridge is not None
         self._stop_bridge()
-        self._start_bridge()
+        if was_connected or force_connect:
+            self._start_bridge()
 
     def _refresh_mode_button_styles(self) -> None:
         if self._cfg.simulate:
@@ -890,7 +907,7 @@ class BridgeGui:
             return
         self._cfg.mqtt_host = mqtt_ip
         self._cfg.esp3d_host = esp_ip
-        self._restart_bridge()
+        self._restart_bridge(force_connect=True)
 
     def _update_all_sim_settings(self) -> None:
         try:
@@ -949,7 +966,7 @@ class BridgeGui:
         self.root.destroy()
 
     def run(self) -> None:
-        self._start_bridge()
+        self.status_var.set("Disconnected (click Connect to start)")
         self.root.mainloop()
 
 
