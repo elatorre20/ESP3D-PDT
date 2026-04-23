@@ -124,6 +124,10 @@ class Esp3dMqttBridge:
         self._sim_bed_actual = max(20.0, cfg.simulation_bed_target_c - 6.0)
         self._sim_realistic_temp_inertia = cfg.simulation_realistic_temp_inertia
         self._sim_temp_variance_c = cfg.simulation_temp_variance_c
+        self._sim_extruder_noise_current = 0.0
+        self._sim_bed_noise_current = 0.0
+        self._sim_extruder_noise_target = 0.0
+        self._sim_bed_noise_target = 0.0
 
         self._mqtt = mqtt.Client()
         if cfg.mqtt_username:
@@ -241,6 +245,8 @@ class Esp3dMqttBridge:
         if temp_variance_c is not None:
             self.cfg.simulation_temp_variance_c = temp_variance_c
             self._sim_temp_variance_c = temp_variance_c
+            self._sim_extruder_noise_current = max(-temp_variance_c, min(temp_variance_c, self._sim_extruder_noise_current))
+            self._sim_bed_noise_current = max(-temp_variance_c, min(temp_variance_c, self._sim_bed_noise_current))
 
     def reset_simulation_pattern(self) -> None:
         self._sim_elapsed_s = 0.0
@@ -552,10 +558,27 @@ class Esp3dMqttBridge:
         self._sim_bed_actual += max(-bed_rate * dt, min(bed_rate * dt, bed_delta))
 
         variance_range = max(0.0, self._sim_temp_variance_c)
-        extruder_variance = random.uniform(-variance_range, variance_range)
-        bed_variance = random.uniform(-variance_range, variance_range)
-        extruder_actual = self._sim_extruder_actual + extruder_variance
-        bed_actual = self._sim_bed_actual + bed_variance
+        if variance_range == 0.0:
+            self._sim_extruder_noise_current = 0.0
+            self._sim_bed_noise_current = 0.0
+            self._sim_extruder_noise_target = 0.0
+            self._sim_bed_noise_target = 0.0
+        else:
+            # Keep random jitter, but with strong inertia so fluctuations do not jump too fast.
+            self._sim_extruder_noise_target = random.uniform(-variance_range, variance_range)
+            self._sim_bed_noise_target = random.uniform(-variance_range, variance_range)
+            max_noise_step = dt * 0.12  # C/s
+            self._sim_extruder_noise_current += max(
+                -max_noise_step,
+                min(max_noise_step, self._sim_extruder_noise_target - self._sim_extruder_noise_current),
+            )
+            self._sim_bed_noise_current += max(
+                -max_noise_step,
+                min(max_noise_step, self._sim_bed_noise_target - self._sim_bed_noise_current),
+            )
+
+        extruder_actual = self._sim_extruder_actual + self._sim_extruder_noise_current
+        bed_actual = self._sim_bed_actual + self._sim_bed_noise_current
 
         return {
             "x": x,
