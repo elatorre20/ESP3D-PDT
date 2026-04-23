@@ -30,6 +30,7 @@ import argparse
 import copy
 import logging
 import math
+import random
 import re
 import signal
 import socket
@@ -64,6 +65,7 @@ DEFAULT_SIM_LAYER_HEIGHT_MM = 5.0
 DEFAULT_SIM_LAYERS = 10
 DEFAULT_SIM_EXTRUDER_TARGET_C = 225.0
 DEFAULT_SIM_BED_TARGET_C = 90.0
+DEFAULT_SIM_TEMP_VARIANCE_C = 0.25
 
 METRIC_TYPE_MAPPING = {
     "x": ("x_pos", 1),
@@ -101,6 +103,7 @@ class BridgeConfig:
     simulation_extruder_target_c: float
     simulation_bed_target_c: float
     simulation_realistic_temp_inertia: bool
+    simulation_temp_variance_c: float
 
 
 class Esp3dMqttBridge:
@@ -120,6 +123,7 @@ class Esp3dMqttBridge:
         self._sim_extruder_actual = max(20.0, cfg.simulation_extruder_target_c - 12.0)
         self._sim_bed_actual = max(20.0, cfg.simulation_bed_target_c - 6.0)
         self._sim_realistic_temp_inertia = cfg.simulation_realistic_temp_inertia
+        self._sim_temp_variance_c = cfg.simulation_temp_variance_c
 
         self._mqtt = mqtt.Client()
         if cfg.mqtt_username:
@@ -215,6 +219,7 @@ class Esp3dMqttBridge:
         extruder_target_c: Optional[float] = None,
         bed_target_c: Optional[float] = None,
         realistic_temp_inertia: Optional[bool] = None,
+        temp_variance_c: Optional[float] = None,
     ) -> None:
         if speed_mm_s is not None:
             self.cfg.simulation_speed_mm_s = speed_mm_s
@@ -233,6 +238,9 @@ class Esp3dMqttBridge:
         if realistic_temp_inertia is not None:
             self.cfg.simulation_realistic_temp_inertia = realistic_temp_inertia
             self._sim_realistic_temp_inertia = realistic_temp_inertia
+        if temp_variance_c is not None:
+            self.cfg.simulation_temp_variance_c = temp_variance_c
+            self._sim_temp_variance_c = temp_variance_c
 
     def reset_simulation_pattern(self) -> None:
         self._sim_elapsed_s = 0.0
@@ -543,8 +551,11 @@ class Esp3dMqttBridge:
         bed_rate = 1.2 if bed_delta > 0 else 0.8
         self._sim_bed_actual += max(-bed_rate * dt, min(bed_rate * dt, bed_delta))
 
-        extruder_actual = self._sim_extruder_actual + 0.25 * math.sin(self._sim_elapsed_s * 2.3)
-        bed_actual = self._sim_bed_actual + 0.15 * math.sin(self._sim_elapsed_s * 1.7)
+        variance_range = max(0.0, self._sim_temp_variance_c)
+        extruder_variance = random.uniform(-variance_range, variance_range)
+        bed_variance = random.uniform(-variance_range, variance_range)
+        extruder_actual = self._sim_extruder_actual + extruder_variance
+        bed_actual = self._sim_bed_actual + bed_variance
 
         return {
             "x": x,
@@ -659,6 +670,12 @@ def parse_args() -> BridgeConfig:
         action="store_true",
         help="Simulation mode target temperature inertia (slew-limited to 1 C/s)",
     )
+    parser.add_argument(
+        "--sim-temp-variance-c",
+        type=float,
+        default=DEFAULT_SIM_TEMP_VARIANCE_C,
+        help=f"Simulation mode temperature noise range in C (default: {DEFAULT_SIM_TEMP_VARIANCE_C})",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument("--gui", action="store_true", help="Launch interactive GUI controls")
 
@@ -680,6 +697,8 @@ def parse_args() -> BridgeConfig:
         parser.error("--sim-extruder-target-c must be >= 0")
     if args.sim_bed_target_c < 0:
         parser.error("--sim-bed-target-c must be >= 0")
+    if args.sim_temp_variance_c < 0:
+        parser.error("--sim-temp-variance-c must be >= 0")
 
     return BridgeConfig(
         esp3d_host=args.esp3d_host,
@@ -707,6 +726,7 @@ def parse_args() -> BridgeConfig:
         simulation_extruder_target_c=args.sim_extruder_target_c,
         simulation_bed_target_c=args.sim_bed_target_c,
         simulation_realistic_temp_inertia=args.sim_realistic_temp_inertia,
+        simulation_temp_variance_c=args.sim_temp_variance_c,
     ), args.gui
 
 
@@ -736,6 +756,7 @@ class BridgeGui:
         self.sim_extruder_target_var = tk.StringVar(value=str(cfg.simulation_extruder_target_c))
         self.sim_bed_target_var = tk.StringVar(value=str(cfg.simulation_bed_target_c))
         self.sim_realistic_temp_inertia_var = tk.BooleanVar(value=cfg.simulation_realistic_temp_inertia)
+        self.sim_temp_variance_var = tk.StringVar(value=str(cfg.simulation_temp_variance_c))
         self.status_var = tk.StringVar(value="Disconnected")
 
         self._build_ui()
@@ -796,14 +817,17 @@ class BridgeGui:
             variable=self.sim_realistic_temp_inertia_var,
         )
         self.sim_realistic_temp_inertia_check.grid(row=14, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        tk.Label(self.root, text="Temp Variance Noise ±(C):").grid(row=15, column=0, sticky="w", padx=8, pady=4)
+        self.sim_temp_variance_entry = tk.Entry(self.root, textvariable=self.sim_temp_variance_var, width=24)
+        self.sim_temp_variance_entry.grid(row=15, column=1, padx=8, pady=4)
 
         self.update_sim_btn = tk.Button(self.root, text="Update All Sim Settings", command=self._update_all_sim_settings, width=42)
-        self.update_sim_btn.grid(row=15, column=0, columnspan=2, padx=8, pady=8)
+        self.update_sim_btn.grid(row=16, column=0, columnspan=2, padx=8, pady=8)
         self.reset_btn = tk.Button(self.root, text="Reset to Bottom Layer Start", command=self._reset_pattern, width=42)
-        self.reset_btn.grid(row=16, column=0, columnspan=2, padx=8, pady=6)
+        self.reset_btn.grid(row=17, column=0, columnspan=2, padx=8, pady=6)
 
         tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="blue").grid(
-            row=17, column=0, columnspan=2, sticky="w", padx=8, pady=8
+            row=18, column=0, columnspan=2, sticky="w", padx=8, pady=8
         )
 
         self._update_sim_buttons_state()
@@ -818,6 +842,7 @@ class BridgeGui:
             self.sim_extruder_target_entry,
             self.sim_bed_target_entry,
             self.sim_realistic_temp_inertia_check,
+            self.sim_temp_variance_entry,
             self.update_sim_btn,
             self.reset_btn,
         ):
@@ -918,6 +943,7 @@ class BridgeGui:
             extruder_target = float(self.sim_extruder_target_var.get().strip())
             bed_target = float(self.sim_bed_target_var.get().strip())
             realistic_temp_inertia = bool(self.sim_realistic_temp_inertia_var.get())
+            temp_variance = float(self.sim_temp_variance_var.get().strip())
         except ValueError:
             self._messagebox.showerror(
                 "Invalid Input",
@@ -937,6 +963,12 @@ class BridgeGui:
                 "Extruder and bed target temperatures must be greater than or equal to 0.",
             )
             return
+        if temp_variance < 0:
+            self._messagebox.showerror(
+                "Invalid Input",
+                "Temperature variance noise range must be greater than or equal to 0.",
+            )
+            return
 
         self._cfg.simulation_diameter_mm = diameter
         self._cfg.simulation_layer_height_mm = layer_height
@@ -945,6 +977,7 @@ class BridgeGui:
         self._cfg.simulation_extruder_target_c = extruder_target
         self._cfg.simulation_bed_target_c = bed_target
         self._cfg.simulation_realistic_temp_inertia = realistic_temp_inertia
+        self._cfg.simulation_temp_variance_c = temp_variance
 
         if self._bridge:
             self._bridge.update_simulation_settings(
@@ -955,6 +988,7 @@ class BridgeGui:
                 extruder_target_c=extruder_target,
                 bed_target_c=bed_target,
                 realistic_temp_inertia=realistic_temp_inertia,
+                temp_variance_c=temp_variance,
             )
 
     def _reset_pattern(self) -> None:
