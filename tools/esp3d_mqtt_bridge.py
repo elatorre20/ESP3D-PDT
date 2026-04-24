@@ -483,6 +483,12 @@ class Esp3dMqttBridge:
                 values["bed_target"] = float(target)
         return values
 
+    def _parse_all_telemetry(self, text: str) -> Dict[str, float]:
+        telemetry: Dict[str, float] = {}
+        telemetry.update(self._parse_m114(text))
+        telemetry.update(self._parse_m105(text))
+        return telemetry
+
     def _publish(self, metric: str, value: float) -> None:
         if metric not in METRIC_TYPE_MAPPING:
             logging.debug("Skipping unsupported metric for MQTT payload format: %s", metric)
@@ -538,10 +544,13 @@ class Esp3dMqttBridge:
                             expect_pattern=M105_TEMP_REGEX,
                             retries=0,
                         )
-                        for metric, value in temps.items():
+                        telemetry = self._parse_all_telemetry(m105_text)
+                        for metric, value in telemetry.items():
                             self._publish(metric, value)
                         if not temps:
                             logging.warning("No temperature values parsed from M105 response: %r", m105_text)
+                        if not telemetry:
+                            logging.warning("No telemetry values parsed from M105 response: %r", m105_text)
                         self._next_realtime_poll_cmd = "M114"
                     else:
                         m114_text, pos = self._poll_with_retries(
@@ -550,10 +559,13 @@ class Esp3dMqttBridge:
                             expect_pattern=M114_REGEX,
                             retries=self.cfg.m114_retries,
                         )
-                        for metric, value in pos.items():
+                        telemetry = self._parse_all_telemetry(m114_text)
+                        for metric, value in telemetry.items():
                             self._publish(metric, value)
                         if not pos:
                             logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
+                        if not telemetry:
+                            logging.warning("No telemetry values parsed from M114 response: %r", m114_text)
                         self._next_realtime_poll_cmd = "M105"
 
             except (socket.error, ConnectionError, EOFError) as err:
