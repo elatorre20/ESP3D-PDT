@@ -61,6 +61,8 @@ DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
 DEFAULT_M114_RETRIES = 2
 DEFAULT_BUSY_RETRY_DELAY_S = 0.15
+DEFAULT_M114_RESPONSE_TIMEOUT_S = 4.0
+DEFAULT_FORWARDED_COMMAND_DRAIN_S = 0.35
 DEFAULT_SIM_SPEED_MM_S = 10.0
 DEFAULT_SIM_DIAMETER_MM = 100.0
 DEFAULT_SIM_LAYER_HEIGHT_MM = 2
@@ -96,9 +98,11 @@ class BridgeConfig:
     mqtt_qos: int
     mqtt_retain: bool
     command_response_timeout_s: float
+    m114_response_timeout_s: float
     response_idle_gap_s: float
     m114_retries: int
     busy_retry_delay_s: float
+    forwarded_command_drain_s: float
     simulate: bool
     simulation_speed_mm_s: float
     simulation_diameter_mm: float
@@ -323,7 +327,13 @@ class Esp3dMqttBridge:
         text_l = text.lower()
         return "busy: processing" in text_l or "echo:busy" in text_l
 
-    def _telnet_cmd_and_collect(self, cmd: str, *, expect_pattern: Optional[re.Pattern] = None) -> str:
+    def _telnet_cmd_and_collect(
+        self,
+        cmd: str,
+        *,
+        expect_pattern: Optional[re.Pattern] = None,
+        timeout_s: Optional[float] = None,
+    ) -> str:
         with self._telnet_lock:
             self._ensure_telnet()
             assert self._tn is not None
@@ -334,7 +344,9 @@ class Esp3dMqttBridge:
             logging.info("Sending printer command: %s", cmd)
             self._tn.write((cmd + "\r\n").encode("utf-8"))
 
-            end = time.time() + self.cfg.command_response_timeout_s
+            end = time.time() + (
+                self.cfg.command_response_timeout_s if timeout_s is None else max(0.0, timeout_s)
+            )
             last_data_time: Optional[float] = None
             got_expected = bool(expect_pattern and pending_text and expect_pattern.search(pending_text))
             chunks = [pending_text] if pending_text else []
@@ -373,10 +385,15 @@ class Esp3dMqttBridge:
         *,
         expect_pattern: Optional[re.Pattern] = None,
         retries: int = 0,
+        timeout_s: Optional[float] = None,
     ) -> tuple[str, Dict[str, float]]:
         last_text = ""
         for attempt in range(retries + 1):
-            last_text = self._telnet_cmd_and_collect(cmd, expect_pattern=expect_pattern)
+            last_text = self._telnet_cmd_and_collect(
+                cmd,
+                expect_pattern=expect_pattern,
+                timeout_s=timeout_s,
+            )
             parsed = parse_func(last_text)
             if parsed:
                 return last_text, parsed
@@ -405,6 +422,12 @@ class Esp3dMqttBridge:
             assert self._tn is not None
             logging.info("Raw printer command: %s", cmd)
             self._tn.write((cmd + "\r\n").encode("utf-8"))
+            # Unsolicited forwarded commands can leave responses queued on the telnet
+            # socket and pollute the next polled command parse.
+            if self.cfg.forwarded_command_drain_s > 0:
+                drained = self._read_pending_telnet(self.cfg.forwarded_command_drain_s)
+                if drained:
+                    logging.debug("Forwarded command immediate response: %r", drained)
 
     @staticmethod
     def _extract_printer_command(payload: str) -> tuple[Optional[str], Optional[str]]:
@@ -574,6 +597,7 @@ class Esp3dMqttBridge:
                             self._parse_m114,
                             expect_pattern=M114_REGEX,
                             retries=self.cfg.m114_retries,
+                            timeout_s=self.cfg.m114_response_timeout_s,
                         )
                         telemetry = self._parse_all_telemetry(m114_text)
                         for metric, value in telemetry.items():
@@ -738,6 +762,12 @@ def parse_args() -> BridgeConfig:
         help=f"Max seconds to wait for response bytes (default: {DEFAULT_COMMAND_RESPONSE_TIMEOUT_S})",
     )
     parser.add_argument(
+        "--m114-response-timeout-s",
+        type=float,
+        default=DEFAULT_M114_RESPONSE_TIMEOUT_S,
+        help=f"Max seconds to wait for M114 response bytes (default: {DEFAULT_M114_RESPONSE_TIMEOUT_S})",
+    )
+    parser.add_argument(
         "--response-idle-gap-s",
         type=float,
         default=DEFAULT_RESPONSE_IDLE_GAP_S,
@@ -754,6 +784,15 @@ def parse_args() -> BridgeConfig:
         type=float,
         default=DEFAULT_BUSY_RETRY_DELAY_S,
         help=f"Base delay before retrying after busy response (default: {DEFAULT_BUSY_RETRY_DELAY_S})",
+    )
+    parser.add_argument(
+        "--forwarded-command-drain-s",
+        type=float,
+        default=DEFAULT_FORWARDED_COMMAND_DRAIN_S,
+        help=(
+            "Seconds to drain immediate telnet output after forwarding MQTT actuator commands "
+            f"(default: {DEFAULT_FORWARDED_COMMAND_DRAIN_S})"
+        ),
     )
     parser.add_argument("--mqtt-qos", type=int, choices=[0, 1, 2], default=0, help="MQTT QoS")
     parser.add_argument("--mqtt-retain", action="store_true", help="Set MQTT retain flag")
@@ -834,8 +873,12 @@ def parse_args() -> BridgeConfig:
         parser.error("--sim-temp-variance-c must be >= 0")
     if args.m114_retries < 0:
         parser.error("--m114-retries must be >= 0")
+    if args.m114_response_timeout_s <= 0:
+        parser.error("--m114-response-timeout-s must be > 0")
     if args.busy_retry_delay_s < 0:
         parser.error("--busy-retry-delay-s must be >= 0")
+    if args.forwarded_command_drain_s < 0:
+        parser.error("--forwarded-command-drain-s must be >= 0")
 
     return BridgeConfig(
         esp3d_host=args.esp3d_host,
@@ -854,9 +897,11 @@ def parse_args() -> BridgeConfig:
         mqtt_qos=args.mqtt_qos,
         mqtt_retain=args.mqtt_retain,
         command_response_timeout_s=args.command_response_timeout_s,
+        m114_response_timeout_s=args.m114_response_timeout_s,
         response_idle_gap_s=args.response_idle_gap_s,
         m114_retries=args.m114_retries,
         busy_retry_delay_s=args.busy_retry_delay_s,
+        forwarded_command_drain_s=args.forwarded_command_drain_s,
         simulate=args.simulate,
         simulation_speed_mm_s=args.speed,
         simulation_diameter_mm=args.diameter,
