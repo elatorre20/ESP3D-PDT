@@ -59,6 +59,8 @@ DEFAULT_MQTT_COMMAND_TOPIC = "PDT/EdgeDevice/ActuatorCmd"
 DEFAULT_SENSOR_TYPE_CATEGORY_ID = 1000
 DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
+DEFAULT_M114_RETRIES = 2
+DEFAULT_BUSY_RETRY_DELAY_S = 0.15
 DEFAULT_SIM_SPEED_MM_S = 10.0
 DEFAULT_SIM_DIAMETER_MM = 100.0
 DEFAULT_SIM_LAYER_HEIGHT_MM = 2
@@ -95,6 +97,8 @@ class BridgeConfig:
     mqtt_retain: bool
     command_response_timeout_s: float
     response_idle_gap_s: float
+    m114_retries: int
+    busy_retry_delay_s: float
     simulate: bool
     simulation_speed_mm_s: float
     simulation_diameter_mm: float
@@ -128,6 +132,7 @@ class Esp3dMqttBridge:
         self._sim_bed_noise_current = 0.0
         self._sim_extruder_noise_target = 0.0
         self._sim_bed_noise_target = 0.0
+        self._next_realtime_poll_cmd = "M105"
 
         self._mqtt = mqtt.Client()
         if cfg.mqtt_username:
@@ -213,6 +218,11 @@ class Esp3dMqttBridge:
         logging.info("Stopping bridge...")
         self._running = False
 
+    def _sleep_with_stop(self, duration_s: float) -> None:
+        end = time.time() + max(0.0, duration_s)
+        while self._running and time.time() < end:
+            time.sleep(min(0.05, end - time.time()))
+
     def update_simulation_settings(
         self,
         *,
@@ -293,7 +303,12 @@ class Esp3dMqttBridge:
             else:
                 logging.debug("Drained telnet bytes: %r", chunk.decode("utf-8", errors="replace"))
 
-    def _telnet_cmd_and_collect(self, cmd: str) -> str:
+    @staticmethod
+    def _response_has_busy_message(text: str) -> bool:
+        text_l = text.lower()
+        return "busy: processing" in text_l or "echo:busy" in text_l
+
+    def _telnet_cmd_and_collect(self, cmd: str, *, expect_pattern: Optional[re.Pattern] = None) -> str:
         with self._telnet_lock:
             self._ensure_telnet()
             assert self._tn is not None
@@ -304,6 +319,7 @@ class Esp3dMqttBridge:
 
             end = time.time() + self.cfg.command_response_timeout_s
             last_data_time: Optional[float] = None
+            got_expected = False
             chunks = []
             while time.time() < end:
                 try:
@@ -314,17 +330,57 @@ class Esp3dMqttBridge:
                     now = time.time()
                     last_data_time = now
                     chunks.append(data.decode("utf-8", errors="replace"))
+                    if expect_pattern and expect_pattern.search("".join(chunks)):
+                        got_expected = True
                     continue
                 else:
-                    # If we already received bytes for this command and line stays idle,
-                    # treat the response as complete.
-                    if last_data_time is not None and (time.time() - last_data_time) >= self.cfg.response_idle_gap_s:
+                    # If we already received bytes for this command and line stays idle:
+                    # - with expected data pattern, stop only after it has been observed
+                    # - otherwise use generic idle-gap completion.
+                    if (
+                        last_data_time is not None
+                        and (time.time() - last_data_time) >= self.cfg.response_idle_gap_s
+                        and (got_expected or expect_pattern is None)
+                    ):
                         break
                     time.sleep(0.02)
 
         text = "".join(chunks)
         logging.info("Raw response for %s: %r", cmd, text)
         return text
+
+    def _poll_with_retries(
+        self,
+        cmd: str,
+        parse_func,
+        *,
+        expect_pattern: Optional[re.Pattern] = None,
+        retries: int = 0,
+    ) -> tuple[str, Dict[str, float]]:
+        last_text = ""
+        for attempt in range(retries + 1):
+            last_text = self._telnet_cmd_and_collect(cmd, expect_pattern=expect_pattern)
+            parsed = parse_func(last_text)
+            if parsed:
+                return last_text, parsed
+
+            if attempt >= retries:
+                break
+
+            if self._response_has_busy_message(last_text):
+                delay = self.cfg.busy_retry_delay_s * (attempt + 1)
+                logging.info(
+                    "%s received busy response without telemetry; retrying in %.2fs (attempt %d/%d)",
+                    cmd,
+                    delay,
+                    attempt + 1,
+                    retries,
+                )
+                time.sleep(delay)
+            else:
+                break
+
+        return last_text, {}
 
     def _telnet_send_only(self, cmd: str) -> None:
         with self._telnet_lock:
@@ -465,6 +521,9 @@ class Esp3dMqttBridge:
 
     def run(self) -> None:
         logging.info("Bridge started: polling every %.2fs", self.cfg.poll_interval_s)
+        half_period_s = max(0.0, self.cfg.poll_interval_s / 2.0)
+        if not self.cfg.simulate:
+            logging.info("Real mode staggered polling: alternating M105/M114 every %.2fs", half_period_s)
         while self._running:
             try:
                 if self.cfg.simulate:
@@ -472,19 +531,30 @@ class Esp3dMqttBridge:
                     for metric, value in metrics.items():
                         self._publish(metric, value)
                 else:
-                    m114_text = self._telnet_cmd_and_collect("M114")
-                    m105_text = self._telnet_cmd_and_collect("M105")
-                    pos = self._parse_m114(m114_text)
-                    temps = self._parse_m105(m105_text)
-
-                    metrics = {**pos, **temps}
-                    for metric, value in metrics.items():
-                        self._publish(metric, value)
-
-                    if not pos:
-                        logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
-                    if not temps:
-                        logging.warning("No temperature values parsed from M105 response: %r", m105_text)
+                    if self._next_realtime_poll_cmd == "M105":
+                        m105_text, temps = self._poll_with_retries(
+                            "M105",
+                            self._parse_m105,
+                            expect_pattern=M105_TEMP_REGEX,
+                            retries=0,
+                        )
+                        for metric, value in temps.items():
+                            self._publish(metric, value)
+                        if not temps:
+                            logging.warning("No temperature values parsed from M105 response: %r", m105_text)
+                        self._next_realtime_poll_cmd = "M114"
+                    else:
+                        m114_text, pos = self._poll_with_retries(
+                            "M114",
+                            self._parse_m114,
+                            expect_pattern=M114_REGEX,
+                            retries=self.cfg.m114_retries,
+                        )
+                        for metric, value in pos.items():
+                            self._publish(metric, value)
+                        if not pos:
+                            logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
+                        self._next_realtime_poll_cmd = "M105"
 
             except (socket.error, ConnectionError, EOFError) as err:
                 if self.cfg.simulate:
@@ -506,7 +576,7 @@ class Esp3dMqttBridge:
             except Exception as err:
                 logging.exception("Bridge loop error: %s", err)
 
-            time.sleep(self.cfg.poll_interval_s)
+            self._sleep_with_stop(self.cfg.poll_interval_s if self.cfg.simulate else half_period_s)
 
     def _generate_simulated_metrics(self) -> Dict[str, float]:
         radius_mm = self.cfg.simulation_diameter_mm / 2.0
@@ -645,6 +715,18 @@ def parse_args() -> BridgeConfig:
         default=DEFAULT_RESPONSE_IDLE_GAP_S,
         help=f"Consider response complete after this idle gap (default: {DEFAULT_RESPONSE_IDLE_GAP_S})",
     )
+    parser.add_argument(
+        "--m114-retries",
+        type=int,
+        default=DEFAULT_M114_RETRIES,
+        help=f"Number of M114 retries when only busy/no position is received (default: {DEFAULT_M114_RETRIES})",
+    )
+    parser.add_argument(
+        "--busy-retry-delay-s",
+        type=float,
+        default=DEFAULT_BUSY_RETRY_DELAY_S,
+        help=f"Base delay before retrying after busy response (default: {DEFAULT_BUSY_RETRY_DELAY_S})",
+    )
     parser.add_argument("--mqtt-qos", type=int, choices=[0, 1, 2], default=0, help="MQTT QoS")
     parser.add_argument("--mqtt-retain", action="store_true", help="Set MQTT retain flag")
     parser.add_argument(
@@ -722,6 +804,10 @@ def parse_args() -> BridgeConfig:
         parser.error("--sim-bed-target-c must be >= 0")
     if args.sim_temp_variance_c < 0:
         parser.error("--sim-temp-variance-c must be >= 0")
+    if args.m114_retries < 0:
+        parser.error("--m114-retries must be >= 0")
+    if args.busy_retry_delay_s < 0:
+        parser.error("--busy-retry-delay-s must be >= 0")
 
     return BridgeConfig(
         esp3d_host=args.esp3d_host,
@@ -741,6 +827,8 @@ def parse_args() -> BridgeConfig:
         mqtt_retain=args.mqtt_retain,
         command_response_timeout_s=args.command_response_timeout_s,
         response_idle_gap_s=args.response_idle_gap_s,
+        m114_retries=args.m114_retries,
+        busy_retry_delay_s=args.busy_retry_delay_s,
         simulate=args.simulate,
         simulation_speed_mm_s=args.speed,
         simulation_diameter_mm=args.diameter,
