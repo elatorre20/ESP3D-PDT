@@ -303,6 +303,21 @@ class Esp3dMqttBridge:
             else:
                 logging.debug("Drained telnet bytes: %r", chunk.decode("utf-8", errors="replace"))
 
+    def _read_pending_telnet(self, duration_s: float = 0.05) -> str:
+        if not self._tn:
+            return ""
+        end = time.time() + max(0.0, duration_s)
+        chunks = []
+        while self._tn and time.time() < end:
+            try:
+                chunk = self._tn.read_very_eager()
+            except EOFError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk.decode("utf-8", errors="replace"))
+        return "".join(chunks)
+
     @staticmethod
     def _response_has_busy_message(text: str) -> bool:
         text_l = text.lower()
@@ -313,14 +328,16 @@ class Esp3dMqttBridge:
             self._ensure_telnet()
             assert self._tn is not None
 
-            self._drain_telnet(0.1)
+            pending_text = self._read_pending_telnet(0.05)
+            if pending_text:
+                logging.debug("Pre-command pending telnet bytes kept for parsing: %r", pending_text)
             logging.info("Sending printer command: %s", cmd)
-            self._tn.write((cmd + "\n").encode("utf-8"))
+            self._tn.write((cmd + "\r\n").encode("utf-8"))
 
             end = time.time() + self.cfg.command_response_timeout_s
             last_data_time: Optional[float] = None
-            got_expected = False
-            chunks = []
+            got_expected = bool(expect_pattern and pending_text and expect_pattern.search(pending_text))
+            chunks = [pending_text] if pending_text else []
             while time.time() < end:
                 try:
                     data = self._tn.read_very_eager()
@@ -386,9 +403,8 @@ class Esp3dMqttBridge:
         with self._telnet_lock:
             self._ensure_telnet()
             assert self._tn is not None
-            self._drain_telnet(0.05)
             logging.info("Raw printer command: %s", cmd)
-            self._tn.write((cmd + "\n").encode("utf-8"))
+            self._tn.write((cmd + "\r\n").encode("utf-8"))
 
     @staticmethod
     def _extract_printer_command(payload: str) -> tuple[Optional[str], Optional[str]]:
