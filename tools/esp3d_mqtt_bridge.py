@@ -2,8 +2,8 @@
 """
 ESP3D -> MQTT bridge.
 
-This bridge uses a **full-duplex Telnet connection** to ESP3D so it can read real
-printer responses (e.g. M114 / M105 output), then publishes parsed values to MQTT.
+This bridge uses a **full-duplex Telnet connection** to ESP3D so it can read the
+incoming printer message stream and publish parsed telemetry to MQTT immediately.
 
 Why Telnet mode:
 - ESP3D HTTP `/command?cmd=...` returns "ESP3D says: command forwarded" for
@@ -59,9 +59,6 @@ DEFAULT_MQTT_COMMAND_TOPIC = "PDT/EdgeDevice/ActuatorCmd"
 DEFAULT_SENSOR_TYPE_CATEGORY_ID = 1000
 DEFAULT_COMMAND_RESPONSE_TIMEOUT_S = 2.0
 DEFAULT_RESPONSE_IDLE_GAP_S = 0.25
-DEFAULT_M114_RETRIES = 2
-DEFAULT_BUSY_RETRY_DELAY_S = 0.15
-DEFAULT_M114_RESPONSE_TIMEOUT_S = 4.0
 DEFAULT_FORWARDED_COMMAND_DRAIN_S = 0.35
 DEFAULT_SIM_SPEED_MM_S = 10.0
 DEFAULT_SIM_DIAMETER_MM = 100.0
@@ -98,10 +95,6 @@ class BridgeConfig:
     mqtt_qos: int
     mqtt_retain: bool
     command_response_timeout_s: float
-    m114_response_timeout_s: float
-    response_idle_gap_s: float
-    m114_retries: int
-    busy_retry_delay_s: float
     forwarded_command_drain_s: float
     simulate: bool
     simulation_speed_mm_s: float
@@ -136,7 +129,7 @@ class Esp3dMqttBridge:
         self._sim_bed_noise_current = 0.0
         self._sim_extruder_noise_target = 0.0
         self._sim_bed_noise_target = 0.0
-        self._next_realtime_poll_cmd = "M105"
+        self._realtime_line_buffer = ""
 
         self._mqtt = mqtt.Client()
         if cfg.mqtt_username:
@@ -322,100 +315,6 @@ class Esp3dMqttBridge:
             chunks.append(chunk.decode("utf-8", errors="replace"))
         return "".join(chunks)
 
-    @staticmethod
-    def _response_has_busy_message(text: str) -> bool:
-        text_l = text.lower()
-        return "busy: processing" in text_l or "echo:busy" in text_l
-
-    def _telnet_cmd_and_collect(
-        self,
-        cmd: str,
-        *,
-        expect_pattern: Optional[re.Pattern] = None,
-        timeout_s: Optional[float] = None,
-    ) -> str:
-        with self._telnet_lock:
-            self._ensure_telnet()
-            assert self._tn is not None
-
-            pending_text = self._read_pending_telnet(0.05)
-            if pending_text:
-                logging.debug("Pre-command pending telnet bytes kept for parsing: %r", pending_text)
-            logging.info("Sending printer command: %s", cmd)
-            self._tn.write((cmd + "\r\n").encode("utf-8"))
-
-            end = time.time() + (
-                self.cfg.command_response_timeout_s if timeout_s is None else max(0.0, timeout_s)
-            )
-            last_data_time: Optional[float] = None
-            got_expected = bool(expect_pattern and pending_text and expect_pattern.search(pending_text))
-            chunks = [pending_text] if pending_text else []
-            while time.time() < end:
-                try:
-                    data = self._tn.read_very_eager()
-                except EOFError as err:
-                    raise ConnectionError("ESP3D telnet connection closed") from err
-                if data:
-                    now = time.time()
-                    last_data_time = now
-                    chunks.append(data.decode("utf-8", errors="replace"))
-                    if expect_pattern and expect_pattern.search("".join(chunks)):
-                        got_expected = True
-                    continue
-                else:
-                    # If we already received bytes for this command and line stays idle:
-                    # - with expected data pattern, stop only after it has been observed
-                    # - otherwise use generic idle-gap completion.
-                    if (
-                        last_data_time is not None
-                        and (time.time() - last_data_time) >= self.cfg.response_idle_gap_s
-                        and (got_expected or expect_pattern is None)
-                    ):
-                        break
-                    time.sleep(0.02)
-
-        text = "".join(chunks)
-        logging.info("Raw response for %s: %r", cmd, text)
-        return text
-
-    def _poll_with_retries(
-        self,
-        cmd: str,
-        parse_func,
-        *,
-        expect_pattern: Optional[re.Pattern] = None,
-        retries: int = 0,
-        timeout_s: Optional[float] = None,
-    ) -> tuple[str, Dict[str, float]]:
-        last_text = ""
-        for attempt in range(retries + 1):
-            last_text = self._telnet_cmd_and_collect(
-                cmd,
-                expect_pattern=expect_pattern,
-                timeout_s=timeout_s,
-            )
-            parsed = parse_func(last_text)
-            if parsed:
-                return last_text, parsed
-
-            if attempt >= retries:
-                break
-
-            if self._response_has_busy_message(last_text):
-                delay = self.cfg.busy_retry_delay_s * (attempt + 1)
-                logging.info(
-                    "%s received busy response without telemetry; retrying in %.2fs (attempt %d/%d)",
-                    cmd,
-                    delay,
-                    attempt + 1,
-                    retries,
-                )
-                time.sleep(delay)
-            else:
-                break
-
-        return last_text, {}
-
     def _telnet_send_only(self, cmd: str) -> None:
         with self._telnet_lock:
             self._ensure_telnet()
@@ -528,6 +427,29 @@ class Esp3dMqttBridge:
         telemetry.update(self._parse_m105(text))
         return telemetry
 
+    def _publish_telemetry_from_stream_text(self, text: str) -> bool:
+        if not text:
+            return False
+
+        stream = self._realtime_line_buffer + text
+        lines = stream.splitlines(keepends=True)
+        self._realtime_line_buffer = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._realtime_line_buffer = lines.pop()
+
+        published = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            telemetry = self._parse_all_telemetry(line)
+            if telemetry:
+                logging.info("Telemetry stream line: %s", line)
+                for metric, value in telemetry.items():
+                    self._publish(metric, value)
+                    published = True
+        return published
+
     def _publish(self, metric: str, value: float) -> None:
         if metric not in METRIC_TYPE_MAPPING:
             logging.debug("Skipping unsupported metric for MQTT payload format: %s", metric)
@@ -565,10 +487,11 @@ class Esp3dMqttBridge:
             logging.info("Published MQTT topic=%s payload=%s", self.cfg.mqtt_topic, payload)
 
     def run(self) -> None:
-        logging.info("Bridge started: polling every %.2fs", self.cfg.poll_interval_s)
-        half_period_s = max(0.0, self.cfg.poll_interval_s / 2.0)
-        if not self.cfg.simulate:
-            logging.info("Real mode staggered polling: alternating M105/M114 every %.2fs", half_period_s)
+        logging.info("Bridge started")
+        if self.cfg.simulate:
+            logging.info("Simulation mode publish interval %.2fs", self.cfg.poll_interval_s)
+        else:
+            logging.info("Real mode telemetry: listening to printer response stream (no M105/M114 polling)")
         while self._running:
             try:
                 if self.cfg.simulate:
@@ -576,37 +499,10 @@ class Esp3dMqttBridge:
                     for metric, value in metrics.items():
                         self._publish(metric, value)
                 else:
-                    if self._next_realtime_poll_cmd == "M105":
-                        m105_text, temps = self._poll_with_retries(
-                            "M105",
-                            self._parse_m105,
-                            expect_pattern=M105_TEMP_REGEX,
-                            retries=0,
-                        )
-                        telemetry = self._parse_all_telemetry(m105_text)
-                        for metric, value in telemetry.items():
-                            self._publish(metric, value)
-                        if not temps:
-                            logging.warning("No temperature values parsed from M105 response: %r", m105_text)
-                        if not telemetry:
-                            logging.warning("No telemetry values parsed from M105 response: %r", m105_text)
-                        self._next_realtime_poll_cmd = "M114"
-                    else:
-                        m114_text, pos = self._poll_with_retries(
-                            "M114",
-                            self._parse_m114,
-                            expect_pattern=M114_REGEX,
-                            retries=self.cfg.m114_retries,
-                            timeout_s=self.cfg.m114_response_timeout_s,
-                        )
-                        telemetry = self._parse_all_telemetry(m114_text)
-                        for metric, value in telemetry.items():
-                            self._publish(metric, value)
-                        if not pos:
-                            logging.warning("No XYZ values parsed from M114 response: %r", m114_text)
-                        if not telemetry:
-                            logging.warning("No telemetry values parsed from M114 response: %r", m114_text)
-                        self._next_realtime_poll_cmd = "M105"
+                    with self._telnet_lock:
+                        self._ensure_telnet()
+                        chunk = self._read_pending_telnet(0.2)
+                    self._publish_telemetry_from_stream_text(chunk)
 
             except (socket.error, ConnectionError, EOFError) as err:
                 if self.cfg.simulate:
@@ -628,7 +524,7 @@ class Esp3dMqttBridge:
             except Exception as err:
                 logging.exception("Bridge loop error: %s", err)
 
-            self._sleep_with_stop(self.cfg.poll_interval_s if self.cfg.simulate else half_period_s)
+            self._sleep_with_stop(self.cfg.poll_interval_s if self.cfg.simulate else 0.05)
 
     def _generate_simulated_metrics(self) -> Dict[str, float]:
         radius_mm = self.cfg.simulation_diameter_mm / 2.0
@@ -762,30 +658,6 @@ def parse_args() -> BridgeConfig:
         help=f"Max seconds to wait for response bytes (default: {DEFAULT_COMMAND_RESPONSE_TIMEOUT_S})",
     )
     parser.add_argument(
-        "--m114-response-timeout-s",
-        type=float,
-        default=DEFAULT_M114_RESPONSE_TIMEOUT_S,
-        help=f"Max seconds to wait for M114 response bytes (default: {DEFAULT_M114_RESPONSE_TIMEOUT_S})",
-    )
-    parser.add_argument(
-        "--response-idle-gap-s",
-        type=float,
-        default=DEFAULT_RESPONSE_IDLE_GAP_S,
-        help=f"Consider response complete after this idle gap (default: {DEFAULT_RESPONSE_IDLE_GAP_S})",
-    )
-    parser.add_argument(
-        "--m114-retries",
-        type=int,
-        default=DEFAULT_M114_RETRIES,
-        help=f"Number of M114 retries when only busy/no position is received (default: {DEFAULT_M114_RETRIES})",
-    )
-    parser.add_argument(
-        "--busy-retry-delay-s",
-        type=float,
-        default=DEFAULT_BUSY_RETRY_DELAY_S,
-        help=f"Base delay before retrying after busy response (default: {DEFAULT_BUSY_RETRY_DELAY_S})",
-    )
-    parser.add_argument(
         "--forwarded-command-drain-s",
         type=float,
         default=DEFAULT_FORWARDED_COMMAND_DRAIN_S,
@@ -871,12 +743,6 @@ def parse_args() -> BridgeConfig:
         parser.error("--sim-bed-target-c must be >= 0")
     if args.sim_temp_variance_c < 0:
         parser.error("--sim-temp-variance-c must be >= 0")
-    if args.m114_retries < 0:
-        parser.error("--m114-retries must be >= 0")
-    if args.m114_response_timeout_s <= 0:
-        parser.error("--m114-response-timeout-s must be > 0")
-    if args.busy_retry_delay_s < 0:
-        parser.error("--busy-retry-delay-s must be >= 0")
     if args.forwarded_command_drain_s < 0:
         parser.error("--forwarded-command-drain-s must be >= 0")
 
@@ -897,10 +763,6 @@ def parse_args() -> BridgeConfig:
         mqtt_qos=args.mqtt_qos,
         mqtt_retain=args.mqtt_retain,
         command_response_timeout_s=args.command_response_timeout_s,
-        m114_response_timeout_s=args.m114_response_timeout_s,
-        response_idle_gap_s=args.response_idle_gap_s,
-        m114_retries=args.m114_retries,
-        busy_retry_delay_s=args.busy_retry_delay_s,
         forwarded_command_drain_s=args.forwarded_command_drain_s,
         simulate=args.simulate,
         simulation_speed_mm_s=args.speed,
@@ -932,8 +794,8 @@ class BridgeGui:
         self.mode_var = tk.StringVar(value="Sim" if cfg.simulate else "Real")
         self.mqtt_ip_var = tk.StringVar(value=cfg.mqtt_host)
         self.esp_ip_var = tk.StringVar(value=cfg.esp3d_host)
-        self.data_rate_var = tk.StringVar(value=str(cfg.poll_interval_s))
         self.sim_diameter_var = tk.StringVar(value=str(cfg.simulation_diameter_mm))
+        self.sim_data_rate_var = tk.StringVar(value=str(cfg.poll_interval_s))
         self.sim_layer_height_var = tk.StringVar(value=str(cfg.simulation_layer_height_mm))
         self.sim_layers_var = tk.StringVar(value=str(cfg.simulation_layers))
         self.sim_speed_var = tk.StringVar(value=str(cfg.simulation_speed_mm_s))
@@ -962,56 +824,53 @@ class BridgeGui:
         tk.Label(self.root, text="ESP IP:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         tk.Entry(self.root, textvariable=self.esp_ip_var, width=24).grid(row=2, column=1, padx=8, pady=6)
 
-        tk.Label(self.root, text="Data Rate (s):").grid(row=3, column=0, sticky="w", padx=8, pady=6)
-        tk.Entry(self.root, textvariable=self.data_rate_var, width=24).grid(row=3, column=1, padx=8, pady=6)
-        tk.Button(self.root, text="Apply Data Rate", command=self._apply_data_rate, width=20).grid(
-            row=4, column=0, columnspan=2, padx=8, pady=4
-        )
-
         tk.Button(self.root, text="Reconnect (New IPs)", command=self._reconnect_with_ips, width=20).grid(
-            row=5, column=0, columnspan=2, padx=8, pady=8
+            row=3, column=0, columnspan=2, padx=8, pady=8
         )
         self.connect_btn = tk.Button(self.root, text="Connect", command=self._start_bridge, width=20)
-        self.connect_btn.grid(row=6, column=0, padx=8, pady=(0, 8))
+        self.connect_btn.grid(row=4, column=0, padx=8, pady=(0, 8))
         self.disconnect_btn = tk.Button(self.root, text="Disconnect", command=self._stop_bridge, width=20)
-        self.disconnect_btn.grid(row=6, column=1, padx=8, pady=(0, 8))
+        self.disconnect_btn.grid(row=4, column=1, padx=8, pady=(0, 8))
 
-        tk.Label(self.root, text="Simulation Controls:").grid(row=7, column=0, sticky="w", padx=8, pady=8)
-        tk.Label(self.root, text="Circle Diameter (mm):").grid(row=8, column=0, sticky="w", padx=8, pady=4)
+        tk.Label(self.root, text="Simulation Controls:").grid(row=5, column=0, sticky="w", padx=8, pady=8)
+        tk.Label(self.root, text="Data Rate (s):").grid(row=6, column=0, sticky="w", padx=8, pady=4)
+        self.sim_data_rate_entry = tk.Entry(self.root, textvariable=self.sim_data_rate_var, width=24)
+        self.sim_data_rate_entry.grid(row=6, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Circle Diameter (mm):").grid(row=7, column=0, sticky="w", padx=8, pady=4)
         self.sim_diameter_entry = tk.Entry(self.root, textvariable=self.sim_diameter_var, width=24)
-        self.sim_diameter_entry.grid(row=8, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Layer Height (mm):").grid(row=9, column=0, sticky="w", padx=8, pady=4)
+        self.sim_diameter_entry.grid(row=7, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Layer Height (mm):").grid(row=8, column=0, sticky="w", padx=8, pady=4)
         self.sim_layer_height_entry = tk.Entry(self.root, textvariable=self.sim_layer_height_var, width=24)
-        self.sim_layer_height_entry.grid(row=9, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Layer Number:").grid(row=10, column=0, sticky="w", padx=8, pady=4)
+        self.sim_layer_height_entry.grid(row=8, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Layer Number:").grid(row=9, column=0, sticky="w", padx=8, pady=4)
         self.sim_layers_entry = tk.Entry(self.root, textvariable=self.sim_layers_var, width=24)
-        self.sim_layers_entry.grid(row=10, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Speed (mm/s):").grid(row=11, column=0, sticky="w", padx=8, pady=4)
+        self.sim_layers_entry.grid(row=9, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Speed (mm/s):").grid(row=10, column=0, sticky="w", padx=8, pady=4)
         self.sim_speed_entry = tk.Entry(self.root, textvariable=self.sim_speed_var, width=24)
-        self.sim_speed_entry.grid(row=11, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Extruder Target (C):").grid(row=12, column=0, sticky="w", padx=8, pady=4)
+        self.sim_speed_entry.grid(row=10, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Extruder Target (C):").grid(row=11, column=0, sticky="w", padx=8, pady=4)
         self.sim_extruder_target_entry = tk.Entry(self.root, textvariable=self.sim_extruder_target_var, width=24)
-        self.sim_extruder_target_entry.grid(row=12, column=1, padx=8, pady=4)
-        tk.Label(self.root, text="Bed Target (C):").grid(row=13, column=0, sticky="w", padx=8, pady=4)
+        self.sim_extruder_target_entry.grid(row=11, column=1, padx=8, pady=4)
+        tk.Label(self.root, text="Bed Target (C):").grid(row=12, column=0, sticky="w", padx=8, pady=4)
         self.sim_bed_target_entry = tk.Entry(self.root, textvariable=self.sim_bed_target_var, width=24)
-        self.sim_bed_target_entry.grid(row=13, column=1, padx=8, pady=4)
+        self.sim_bed_target_entry.grid(row=12, column=1, padx=8, pady=4)
         self.sim_realistic_temp_inertia_check = tk.Checkbutton(
             self.root,
             text="Realistic temperature inertia (1 C/s slew)",
             variable=self.sim_realistic_temp_inertia_var,
         )
-        self.sim_realistic_temp_inertia_check.grid(row=14, column=0, columnspan=2, sticky="w", padx=8, pady=4)
-        tk.Label(self.root, text="Temp Variance Noise ±(C):").grid(row=15, column=0, sticky="w", padx=8, pady=4)
+        self.sim_realistic_temp_inertia_check.grid(row=13, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        tk.Label(self.root, text="Temp Variance Noise ±(C):").grid(row=14, column=0, sticky="w", padx=8, pady=4)
         self.sim_temp_variance_entry = tk.Entry(self.root, textvariable=self.sim_temp_variance_var, width=24)
-        self.sim_temp_variance_entry.grid(row=15, column=1, padx=8, pady=4)
+        self.sim_temp_variance_entry.grid(row=14, column=1, padx=8, pady=4)
 
         self.update_sim_btn = tk.Button(self.root, text="Update All Sim Settings", command=self._update_all_sim_settings, width=42)
-        self.update_sim_btn.grid(row=16, column=0, columnspan=2, padx=8, pady=8)
+        self.update_sim_btn.grid(row=15, column=0, columnspan=2, padx=8, pady=8)
         self.reset_btn = tk.Button(self.root, text="Reset to Bottom Layer Start", command=self._reset_pattern, width=42)
-        self.reset_btn.grid(row=17, column=0, columnspan=2, padx=8, pady=6)
+        self.reset_btn.grid(row=16, column=0, columnspan=2, padx=8, pady=6)
 
         tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="blue").grid(
-            row=18, column=0, columnspan=2, sticky="w", padx=8, pady=8
+            row=17, column=0, columnspan=2, sticky="w", padx=8, pady=8
         )
 
         self._update_sim_buttons_state()
@@ -1020,6 +879,7 @@ class BridgeGui:
         state = self._tk.NORMAL if self._cfg.simulate else self._tk.DISABLED
         for widget in (
             self.sim_diameter_entry,
+            self.sim_data_rate_entry,
             self.sim_layer_height_entry,
             self.sim_layers_entry,
             self.sim_speed_entry,
@@ -1096,18 +956,6 @@ class BridgeGui:
     def _set_sim_mode(self) -> None:
         self._set_mode(True)
 
-    def _apply_data_rate(self) -> None:
-        try:
-            poll_interval_s = float(self.data_rate_var.get().strip())
-        except ValueError:
-            self._messagebox.showerror("Invalid Input", "Data rate must be a number in seconds.")
-            return
-        if poll_interval_s <= 0:
-            self._messagebox.showerror("Invalid Input", "Data rate must be greater than 0.")
-            return
-        self._cfg.poll_interval_s = poll_interval_s
-        self._restart_bridge()
-
     def _reconnect_with_ips(self) -> None:
         mqtt_ip = self.mqtt_ip_var.get().strip()
         esp_ip = self.esp_ip_var.get().strip()
@@ -1120,6 +968,7 @@ class BridgeGui:
 
     def _update_all_sim_settings(self) -> None:
         try:
+            poll_interval_s = float(self.sim_data_rate_var.get().strip())
             diameter = float(self.sim_diameter_var.get().strip())
             layer_height = float(self.sim_layer_height_var.get().strip())
             layers = int(self.sim_layers_var.get().strip())
@@ -1135,10 +984,10 @@ class BridgeGui:
             )
             return
 
-        if diameter <= 0 or layer_height <= 0 or layers <= 0 or speed <= 0:
+        if poll_interval_s <= 0 or diameter <= 0 or layer_height <= 0 or layers <= 0 or speed <= 0:
             self._messagebox.showerror(
                 "Invalid Input",
-                "Diameter, layer height, layer number, and speed must all be greater than 0.",
+                "Data rate, diameter, layer height, layer number, and speed must all be greater than 0.",
             )
             return
         if extruder_target < 0 or bed_target < 0:
@@ -1154,6 +1003,7 @@ class BridgeGui:
             )
             return
 
+        self._cfg.poll_interval_s = poll_interval_s
         self._cfg.simulation_diameter_mm = diameter
         self._cfg.simulation_layer_height_mm = layer_height
         self._cfg.simulation_layers = layers
@@ -1166,9 +1016,9 @@ class BridgeGui:
         if self._bridge:
             self._bridge.update_simulation_settings(
                 diameter_mm=diameter,
+                speed_mm_s=speed,
                 layer_height_mm=layer_height,
                 layers=layers,
-                speed_mm_s=speed,
                 extruder_target_c=extruder_target,
                 bed_target_c=bed_target,
                 realistic_temp_inertia=realistic_temp_inertia,
